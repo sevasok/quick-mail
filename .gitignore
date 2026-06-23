@@ -1,0 +1,14 @@
+# Binaries
+sokolabs-mail.exe
+sokolabs-server
+
+# Config and personal data
+sokolabs-mail.cfg
+mailboxes.txt
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Dependency lock (keep go.sum)
