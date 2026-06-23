@@ -1,58 +1,58 @@
 package main
 
 import (
-"bufio"
-"crypto/tls"
-"encoding/json"
-"fmt"
-"io"
-"mime"
-"mime/multipart"
-"mime/quotedprintable"
-"net"
-"net/http"
-"net/mail"
-"os"
-"path/filepath"
-"strings"
-"sync"
-"time"
+	"bufio"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
+	"net"
+	"net/http"
+	"net/mail"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 )
-
-type Email struct {
-ID      int64    `json:"id"`
-From    string   `json:"from"`
-To      []string `json:"to"`
-Subject string   `json:"subject"`
-Body    string   `json:"body"`
-Time    int64    `json:"time"`
-}
 
 const serverVersion = "2"
 
+type Email struct {
+	ID      int64    `json:"id"`
+	From    string   `json:"from"`
+	To      []string `json:"to"`
+	Subject string   `json:"subject"`
+	Body    string   `json:"body"`
+	Time    int64    `json:"time"`
+}
+
 var (
-mu        sync.RWMutex
-store     []Email
-nextID    int64 = 1
-secret    string
-tlsCfg    *tls.Config
-mailboxes map[string]bool
-hostname  string
+	mu        sync.RWMutex
+	store     []Email
+	nextID    int64 = 1
+	secret    string
+	tlsCfg    *tls.Config
+	mailboxes map[string]bool
+	hostname  string
 )
 
 func loadMailboxes() {
-mailboxes = map[string]bool{}
-data, err := os.ReadFile("mailboxes.txt")
-if err != nil {
-return
-}
-for _, line := range strings.Split(string(data), "\n") {
-line = strings.TrimSpace(strings.ToLower(line))
-if line != "" && !strings.HasPrefix(line, "#") {
-mailboxes[line] = true
-}
-}
-fmt.Printf("Loaded %d mailboxes\n", len(mailboxes))
+	mailboxes = map[string]bool{}
+	data, err := os.ReadFile("mailboxes.txt")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(strings.ToLower(line))
+		if line != "" && !strings.HasPrefix(line, "#") {
+			mailboxes[line] = true
+		}
+	}
+	fmt.Printf("Loaded %d mailboxes\n", len(mailboxes))
 }
 
 func saveMailboxes(m map[string]bool) {
@@ -64,174 +64,178 @@ func saveMailboxes(m map[string]bool) {
 }
 
 func main() {
-secret = os.Getenv("TOKEN")
-if secret == "" {
-secret = "changeme"
-fmt.Println("Warning: TOKEN not set, using 'changeme'")
-}
+	secret = os.Getenv("TOKEN")
+	if secret == "" {
+		secret = "changeme"
+		fmt.Println("Warning: TOKEN not set, using 'changeme'")
+	}
 
-// Hostname for SMTP banner: HOSTNAME env > system hostname
-hostname = os.Getenv("HOSTNAME")
-if hostname == "" {
-hostname, _ = os.Hostname()
-}
-if hostname == "" {
-hostname = "localhost"
-}
-fmt.Println("SMTP hostname:", hostname)
+	// Hostname for SMTP banner: HOSTNAME env > system hostname
+	hostname = os.Getenv("HOSTNAME")
+	if hostname == "" {
+		hostname, _ = os.Hostname()
+	}
+	if hostname == "" {
+		hostname = "localhost"
+	}
+	fmt.Println("SMTP hostname:", hostname)
 
-// TLS: check ./fullchain.pem first, then scan /etc/letsencrypt/live/, then snakeoil
-tlsCandidates := []struct{ cert, key string }{
-{"./fullchain.pem", "./privkey.pem"},
-}
-if entries, err := filepath.Glob("/etc/letsencrypt/live/*/fullchain.pem"); err == nil {
-for _, cert := range entries {
-dir := filepath.Dir(cert)
-tlsCandidates = append(tlsCandidates, struct{ cert, key string }{
-cert, filepath.Join(dir, "privkey.pem"),
-})
-}
-}
-tlsCandidates = append(tlsCandidates, struct{ cert, key string }{
-"/etc/ssl/certs/ssl-cert-snakeoil.pem",
-"/etc/ssl/private/ssl-cert-snakeoil.key",
-})
-for _, p := range tlsCandidates {
-cert, err := tls.LoadX509KeyPair(p.cert, p.key)
-if err == nil {
-tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}}
-fmt.Println("TLS loaded from:", p.cert)
-break
-}
-}
-if tlsCfg == nil {
-fmt.Println("Warning: no TLS cert found, STARTTLS unavailable")
-}
+	// TLS: check ./fullchain.pem first, then scan /etc/letsencrypt/live/, then snakeoil
+	tlsCandidates := []struct{ cert, key string }{
+		{"./fullchain.pem", "./privkey.pem"},
+	}
+	if entries, err := filepath.Glob("/etc/letsencrypt/live/*/fullchain.pem"); err == nil {
+		for _, cert := range entries {
+			dir := filepath.Dir(cert)
+			tlsCandidates = append(tlsCandidates, struct{ cert, key string }{
+				cert, filepath.Join(dir, "privkey.pem"),
+			})
+		}
+	}
+	tlsCandidates = append(tlsCandidates, struct{ cert, key string }{
+		"/etc/ssl/certs/ssl-cert-snakeoil.pem",
+		"/etc/ssl/private/ssl-cert-snakeoil.key",
+	})
+	for _, p := range tlsCandidates {
+		cert, err := tls.LoadX509KeyPair(p.cert, p.key)
+		if err == nil {
+			tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}}
+			fmt.Println("TLS loaded from:", p.cert)
+			break
+		}
+	}
+	if tlsCfg == nil {
+		fmt.Println("Warning: no TLS cert found, STARTTLS unavailable")
+	}
 
-go startSMTP()
-loadMailboxes()
-startHTTP()
+	go startSMTP()
+	loadMailboxes()
+	startHTTP()
 }
 
 func startSMTP() {
-ln, err := net.Listen("tcp", ":25")
-if err != nil {
-fmt.Fprintln(os.Stderr, "SMTP listen error:", err)
-os.Exit(1)
-}
-fmt.Println("SMTP listening on :25")
-for {
-conn, err := ln.Accept()
-if err != nil {
-continue
-}
-go handleSMTP(conn)
-}
+	ln, err := net.Listen("tcp", ":25")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "SMTP listen error:", err)
+		os.Exit(1)
+	}
+	fmt.Println("SMTP listening on :25")
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleSMTP(conn)
+	}
 }
 
 func handleSMTP(conn net.Conn) {
-defer conn.Close()
-doSession(conn, false)
+	defer conn.Close()
+	doSession(conn, false)
 }
 
 func doSession(rw net.Conn, upgraded bool) {
-r := bufio.NewReader(rw)
-write := func(s string) { rw.Write([]byte(s + "\r\n")) }
+	r := bufio.NewReader(rw)
+	write := func(s string) { rw.Write([]byte(s + "\r\n")) }
 
-if !upgraded {
-write("220 " + hostname + " ESMTP")
-}
+	if !upgraded {
+		write("220 " + hostname + " ESMTP")
+	}
 
-var from string
-var to []string
-var lines []string
-collecting := false
+	var from string
+	var to []string
+	var lines []string
+	collecting := false
 
-for {
-line, err := r.ReadString('\n')
-if err != nil {
-return
-}
-line = strings.TrimRight(line, "\r\n")
-up := strings.ToUpper(line)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+		up := strings.ToUpper(line)
 
-if collecting {
-if line == "." {
-collecting = false
-saveEmail(from, to, lines)
-write("250 OK")
-from = ""; to = nil; lines = nil
-} else {
-if strings.HasPrefix(line, "..") {
-line = line[1:]
-}
-lines = append(lines, line)
-}
-continue
-}
+		if collecting {
+			if line == "." {
+				collecting = false
+				saveEmail(from, to, lines)
+				write("250 OK")
+				from = ""
+				to = nil
+				lines = nil
+			} else {
+				if strings.HasPrefix(line, "..") {
+					line = line[1:]
+				}
+				lines = append(lines, line)
+			}
+			continue
+		}
 
-switch {
-case strings.HasPrefix(up, "EHLO"), strings.HasPrefix(up, "HELO"):
-write("250-" + hostname)
-write("250-8BITMIME")
-write("250-PIPELINING")
-write("250-SIZE 52428800")
-if tlsCfg != nil && !upgraded {
-write("250 STARTTLS")
-} else {
-write("250 OK")
-}
-case up == "STARTTLS":
-if tlsCfg == nil {
-write("454 TLS not available")
-continue
-}
-write("220 Ready to start TLS")
-tlsConn := tls.Server(rw, tlsCfg)
-if err := tlsConn.Handshake(); err != nil {
-return
-}
-doSession(tlsConn, true)
-return
-case strings.HasPrefix(up, "MAIL FROM:"):
-from = extractAddr(line[10:])
-write("250 OK")
-case strings.HasPrefix(up, "RCPT TO:"):
-addr := strings.ToLower(extractAddr(line[8:]))
-if len(mailboxes) > 0 && !mailboxes[addr] {
-write("550 5.1.1 User unknown")
-continue
-}
-to = append(to, addr)
-write("250 OK")
-case up == "DATA":
-write("354 End with <CRLF>.<CRLF>")
-collecting = true
-lines = nil
-case up == "RSET":
-from = ""; to = nil; lines = nil
-write("250 OK")
-case up == "NOOP":
-write("250 OK")
-case strings.HasPrefix(up, "AUTH"):
-write("235 Authentication successful")
-case strings.HasPrefix(up, "QUIT"):
-write("221 Bye")
-return
-default:
-write("502 Command not implemented")
-}
-}
+		switch {
+		case strings.HasPrefix(up, "EHLO"), strings.HasPrefix(up, "HELO"):
+			write("250-" + hostname)
+			write("250-8BITMIME")
+			write("250-PIPELINING")
+			write("250-SIZE 52428800")
+			if tlsCfg != nil && !upgraded {
+				write("250 STARTTLS")
+			} else {
+				write("250 OK")
+			}
+		case up == "STARTTLS":
+			if tlsCfg == nil {
+				write("454 TLS not available")
+				continue
+			}
+			write("220 Ready to start TLS")
+			tlsConn := tls.Server(rw, tlsCfg)
+			if err := tlsConn.Handshake(); err != nil {
+				return
+			}
+			doSession(tlsConn, true)
+			return
+		case strings.HasPrefix(up, "MAIL FROM:"):
+			from = extractAddr(line[10:])
+			write("250 OK")
+		case strings.HasPrefix(up, "RCPT TO:"):
+			addr := strings.ToLower(extractAddr(line[8:]))
+			if len(mailboxes) > 0 && !mailboxes[addr] {
+				write("550 5.1.1 User unknown")
+				continue
+			}
+			to = append(to, addr)
+			write("250 OK")
+		case up == "DATA":
+			write("354 End with <CRLF>.<CRLF>")
+			collecting = true
+			lines = nil
+		case up == "RSET":
+			from = ""
+			to = nil
+			lines = nil
+			write("250 OK")
+		case up == "NOOP":
+			write("250 OK")
+		case strings.HasPrefix(up, "AUTH"):
+			write("235 Authentication successful")
+		case strings.HasPrefix(up, "QUIT"):
+			write("221 Bye")
+			return
+		default:
+			write("502 Command not implemented")
+		}
+	}
 }
 
 func extractAddr(s string) string {
-s = strings.TrimSpace(s)
-if i := strings.Index(s, "<"); i >= 0 {
-if j := strings.Index(s, ">"); j > i {
-return s[i+1 : j]
-}
-}
-return s
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "<"); i >= 0 {
+		if j := strings.Index(s, ">"); j > i {
+			return s[i+1 : j]
+		}
+	}
+	return s
 }
 
 func parseEmailBody(rawLines []string) (subject, body string) {
@@ -242,8 +246,14 @@ func parseEmailBody(rawLines []string) (subject, body string) {
 		inH := true
 		for i, l := range rawLines {
 			if inH {
-				if l == "" { inH = false; body = strings.Join(rawLines[i+1:], "\n"); break }
-				if strings.HasPrefix(strings.ToUpper(l), "SUBJECT:") { subject = strings.TrimSpace(l[8:]) }
+				if l == "" {
+					inH = false
+					body = strings.Join(rawLines[i+1:], "\n")
+					break
+				}
+				if strings.HasPrefix(strings.ToUpper(l), "SUBJECT:") {
+					subject = strings.TrimSpace(l[8:])
+				}
 			}
 		}
 		return
@@ -261,7 +271,9 @@ func parseEmailBody(rawLines []string) (subject, body string) {
 		mr := multipart.NewReader(msg.Body, params["boundary"])
 		for {
 			p, perr := mr.NextPart()
-			if perr != nil { break }
+			if perr != nil {
+				break
+			}
 			pmt, _, _ := mime.ParseMediaType(p.Header.Get("Content-Type"))
 			if pmt == "text/plain" {
 				var b []byte
@@ -287,66 +299,66 @@ func parseEmailBody(rawLines []string) (subject, body string) {
 }
 
 func saveEmail(from string, to []string, rawLines []string) {
-subject, body := parseEmailBody(rawLines)
+	subject, body := parseEmailBody(rawLines)
 
-mu.Lock()
-e := Email{
-ID:      nextID,
-From:    from,
-To:      to,
-Subject: subject,
-Body:    strings.TrimSpace(body),
-Time:    time.Now().Unix(),
-}
-nextID++
-store = append(store, e)
-mu.Unlock()
-fmt.Printf("[%s] from=%s subject=%q\n", time.Now().Format("15:04:05"), from, subject)
+	mu.Lock()
+	e := Email{
+		ID:      nextID,
+		From:    from,
+		To:      to,
+		Subject: subject,
+		Body:    strings.TrimSpace(body),
+		Time:    time.Now().Unix(),
+	}
+	nextID++
+	store = append(store, e)
+	mu.Unlock()
+	fmt.Printf("[%s] from=%s subject=%q\n", time.Now().Format("15:04:05"), from, subject)
 }
 
 func auth(r *http.Request) bool {
-tok := r.Header.Get("X-Token")
-if tok == "" {
-tok = r.URL.Query().Get("token")
-}
-return tok == secret
+	tok := r.Header.Get("X-Token")
+	if tok == "" {
+		tok = r.URL.Query().Get("token")
+	}
+	return tok == secret
 }
 
 func startHTTP() {
-http.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-fmt.Fprint(w, serverVersion)
-})
+	http.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, serverVersion)
+	})
 
-http.HandleFunc("/mail", func(w http.ResponseWriter, r *http.Request) {
-if !auth(r) {
-w.WriteHeader(http.StatusUnauthorized)
-return
-}
-switch r.Method {
-case http.MethodDelete:
-mu.Lock()
-store = store[:0]
-mu.Unlock()
-fmt.Fprint(w, "ok")
-fmt.Println("Inbox cleared")
-case http.MethodGet:
-after := int64(0)
-fmt.Sscan(r.URL.Query().Get("after"), &after)
-mu.RLock()
-defer mu.RUnlock()
-var out []Email
-for _, e := range store {
-if e.ID > after {
-out = append(out, e)
-}
-}
-if out == nil {
-out = []Email{}
-}
-w.Header().Set("Content-Type", "application/json")
-json.NewEncoder(w).Encode(out)
-}
-})
+	http.HandleFunc("/mail", func(w http.ResponseWriter, r *http.Request) {
+		if !auth(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			mu.Lock()
+			store = store[:0]
+			mu.Unlock()
+			fmt.Fprint(w, "ok")
+			fmt.Println("Inbox cleared")
+		case http.MethodGet:
+			after := int64(0)
+			fmt.Sscan(r.URL.Query().Get("after"), &after)
+			mu.RLock()
+			defer mu.RUnlock()
+			var out []Email
+			for _, e := range store {
+				if e.ID > after {
+					out = append(out, e)
+				}
+			}
+			if out == nil {
+				out = []Email{}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(out)
+		}
+	})
 	http.HandleFunc("/mailboxes", func(w http.ResponseWriter, r *http.Request) {
 		if !auth(r) {
 			w.WriteHeader(http.StatusUnauthorized)
