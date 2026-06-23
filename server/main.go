@@ -13,6 +13,7 @@ import (
 "net/http"
 "net/mail"
 "os"
+"path/filepath"
 "strings"
 "sync"
 "time"
@@ -30,12 +31,13 @@ Time    int64    `json:"time"`
 const serverVersion = "2"
 
 var (
-mu      sync.RWMutex
-store   []Email
-nextID  int64 = 1
-secret  string
-tlsCfg  *tls.Config
+mu        sync.RWMutex
+store     []Email
+nextID    int64 = 1
+secret    string
+tlsCfg    *tls.Config
 mailboxes map[string]bool
+hostname  string
 )
 
 func loadMailboxes() {
@@ -68,17 +70,33 @@ secret = "changeme"
 fmt.Println("Warning: TOKEN not set, using 'changeme'")
 }
 
-// Try to load TLS cert - look in common Let's Encrypt paths
-certPaths := []struct{ cert, key string }{
-{"./fullchain.pem", "./privkey.pem"},
-{"/etc/letsencrypt/live/sokolabs1.vps.webdock.cloud/fullchain.pem",
-"/etc/letsencrypt/live/sokolabs1.vps.webdock.cloud/privkey.pem"},
-{"/etc/letsencrypt/live/sokolabs.net/fullchain.pem",
-"/etc/letsencrypt/live/sokolabs.net/privkey.pem"},
-{"/etc/ssl/certs/ssl-cert-snakeoil.pem",
-"/etc/ssl/private/ssl-cert-snakeoil.key"},
+// Hostname for SMTP banner: HOSTNAME env > system hostname
+hostname = os.Getenv("HOSTNAME")
+if hostname == "" {
+hostname, _ = os.Hostname()
 }
-for _, p := range certPaths {
+if hostname == "" {
+hostname = "localhost"
+}
+fmt.Println("SMTP hostname:", hostname)
+
+// TLS: check ./fullchain.pem first, then scan /etc/letsencrypt/live/, then snakeoil
+tlsCandidates := []struct{ cert, key string }{
+{"./fullchain.pem", "./privkey.pem"},
+}
+if entries, err := filepath.Glob("/etc/letsencrypt/live/*/fullchain.pem"); err == nil {
+for _, cert := range entries {
+dir := filepath.Dir(cert)
+tlsCandidates = append(tlsCandidates, struct{ cert, key string }{
+cert, filepath.Join(dir, "privkey.pem"),
+})
+}
+}
+tlsCandidates = append(tlsCandidates, struct{ cert, key string }{
+"/etc/ssl/certs/ssl-cert-snakeoil.pem",
+"/etc/ssl/private/ssl-cert-snakeoil.key",
+})
+for _, p := range tlsCandidates {
 cert, err := tls.LoadX509KeyPair(p.cert, p.key)
 if err == nil {
 tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}}
@@ -121,7 +139,7 @@ r := bufio.NewReader(rw)
 write := func(s string) { rw.Write([]byte(s + "\r\n")) }
 
 if !upgraded {
-write("220 mail.sokolabs.net ESMTP")
+write("220 " + hostname + " ESMTP")
 }
 
 var from string
@@ -154,7 +172,7 @@ continue
 
 switch {
 case strings.HasPrefix(up, "EHLO"), strings.HasPrefix(up, "HELO"):
-write("250-mail.sokolabs.net")
+write("250-" + hostname)
 write("250-8BITMIME")
 write("250-PIPELINING")
 write("250-SIZE 52428800")
