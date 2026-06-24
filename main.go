@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +25,7 @@ const (
 	configFile    = "quick-mail.cfg"
 	mailboxesFile = "mailboxes.txt"
 	cfAPI         = "https://api.cloudflare.com/client/v4"
-	serverVersion = "3"
+	serverVersion = "4"
 	githubRepo    = "sevasok/quick-mail"
 )
 
@@ -175,6 +176,56 @@ func pushMailboxes(baseURL, token string, list []string) error {
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// syncMailboxes pulls the authoritative shared mailbox list from the server.
+func syncMailboxes(baseURL, token string) ([]string, error) {
+	resp, err := apiClient.Get(baseURL + "/mailboxes?token=" + token)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("wrong token")
+	}
+	var list []string
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// changeMailbox applies a single add or del on the server and returns the
+// updated shared list. Merge-based, so it never overwrites other clients.
+func changeMailbox(baseURL, token, op, addr string) ([]string, error) {
+	u := fmt.Sprintf("%s/mailboxes?op=%s&addr=%s&token=%s",
+		baseURL, op, url.QueryEscape(addr), token)
+	req, _ := http.NewRequest(http.MethodPost, u, nil)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("wrong token")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+	var list []string
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func containsStr(list []string, s string) bool {
+	for _, e := range list {
+		if e == s {
+			return true
+		}
+	}
+	return false
 }
 
 func randomToken() string {
@@ -385,8 +436,28 @@ func main() {
 			fmt.Println("ok")
 		}
 	} else {
-		localList := loadLocalMailboxes()
-		if firstRun && len(localList) == 0 {
+		// List mode: the server is the shared authority. Sync its list first so we
+		// never overwrite addresses other clients added.
+		fmt.Print("Syncing mailboxes from server... ")
+		serverList, err := syncMailboxes(baseURL, cfg.Token)
+		if err != nil {
+			fmt.Println("Warning:", err)
+			serverList = loadLocalMailboxes()
+		} else {
+			fmt.Printf("ok (%d)\n", len(serverList))
+		}
+
+		// Union any local-only addresses into the shared list (merge, not replace).
+		for _, addr := range loadLocalMailboxes() {
+			if !containsStr(serverList, addr) {
+				if updated, aerr := changeMailbox(baseURL, cfg.Token, "add", addr); aerr == nil {
+					serverList = updated
+				}
+			}
+		}
+
+		// First run with an empty shared list: let the user seed it.
+		if firstRun && len(serverList) == 0 {
 			fmt.Println()
 			fmt.Println("No mailboxes configured yet.")
 			fmt.Println("Add addresses now (one per line, blank to finish):")
@@ -396,18 +467,12 @@ func main() {
 					break
 				}
 				addr = strings.ToLower(addr)
-				localList = append(localList, addr)
-			}
-			if len(localList) > 0 {
-				saveLocalMailboxes(localList)
+				if updated, aerr := changeMailbox(baseURL, cfg.Token, "add", addr); aerr == nil {
+					serverList = updated
+				}
 			}
 		}
-		fmt.Printf("Pushing %d mailboxes to server... ", len(localList))
-		if err := pushMailboxes(baseURL, cfg.Token, localList); err != nil {
-			fmt.Println("Warning:", err)
-		} else {
-			fmt.Println("ok")
-		}
+		saveLocalMailboxes(serverList)
 	}
 
 	fmt.Println()
@@ -415,7 +480,7 @@ func main() {
 		fmt.Println("Mode: catch-all (accepting all addresses)")
 	} else {
 		fmt.Println("Mode: verified list")
-		fmt.Println("Commands: add <email>  |  del <email>  |  list")
+		fmt.Println("Commands: add <email>  |  del <email>  |  list  |  sync")
 	}
 	fmt.Println("Global commands: clear (delete all mail)  |  deploy (re-deploy server)  |  setup (re-provision VPS)  |  update (update client + server)")
 	fmt.Println("Listening for mail on *@" + cfg.Domain + " (Ctrl+C to stop)")
@@ -445,19 +510,13 @@ func main() {
 					continue
 				}
 				arg = strings.ToLower(arg)
-				list := loadLocalMailboxes()
-				for _, e := range list {
-					if e == arg {
-						fmt.Println("Already in list:", arg)
-						goto nextCmd
-					}
+				updated, err := changeMailbox(baseURL, cfg.Token, "add", arg)
+				if err != nil {
+					fmt.Println("Warning adding on server:", err)
+				} else {
+					saveLocalMailboxes(updated)
+					fmt.Println("Added:", arg)
 				}
-				list = append(list, arg)
-				saveLocalMailboxes(list)
-				if err := pushMailboxes(baseURL, cfg.Token, list); err != nil {
-					fmt.Println("Warning pushing to server:", err)
-				}
-				fmt.Println("Added:", arg)
 			case "del":
 				if cfg.CatchAll {
 					fmt.Println("Not in list mode.")
@@ -468,30 +527,39 @@ func main() {
 					continue
 				}
 				arg = strings.ToLower(arg)
-				list := loadLocalMailboxes()
-				newList := list[:0]
-				for _, e := range list {
-					if e != arg {
-						newList = append(newList, e)
-					}
+				updated, err := changeMailbox(baseURL, cfg.Token, "del", arg)
+				if err != nil {
+					fmt.Println("Warning removing on server:", err)
+				} else {
+					saveLocalMailboxes(updated)
+					fmt.Println("Removed:", arg)
 				}
-				saveLocalMailboxes(newList)
-				if err := pushMailboxes(baseURL, cfg.Token, newList); err != nil {
-					fmt.Println("Warning pushing to server:", err)
-				}
-				fmt.Println("Removed:", arg)
 			case "list":
 				if cfg.CatchAll {
 					fmt.Println("Catch-all mode: no allowlist.")
 					continue
 				}
-				list := loadLocalMailboxes()
+				list, err := syncMailboxes(baseURL, cfg.Token)
+				if err != nil {
+					fmt.Println("Warning syncing from server:", err)
+					list = loadLocalMailboxes()
+				} else {
+					saveLocalMailboxes(list)
+				}
 				if len(list) == 0 {
 					fmt.Println("No mailboxes yet. Use: add user@" + cfg.Domain)
 				} else {
 					for _, e := range list {
 						fmt.Println(" ", e)
 					}
+				}
+			case "sync":
+				list, err := syncMailboxes(baseURL, cfg.Token)
+				if err != nil {
+					fmt.Println("Sync error:", err)
+				} else {
+					saveLocalMailboxes(list)
+					fmt.Printf("Synced %d mailboxes from server.\n", len(list))
 				}
 			case "clear":
 				if err := clearInbox(baseURL, cfg.Token); err != nil {
@@ -508,7 +576,6 @@ func main() {
 			case "init", "setup":
 				provisionVPS(r, &cfg)
 			}
-		nextCmd:
 		}
 	}()
 

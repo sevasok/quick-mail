@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const serverVersion = "3"
+const serverVersion = "4"
 
 type Email struct {
 	ID      int64    `json:"id"`
@@ -379,6 +379,39 @@ func startHTTP() {
 			}
 			mu.RUnlock()
 			json.NewEncoder(w).Encode(list)
+		case http.MethodPost:
+			// Incremental, merge-based change so concurrent clients never clobber
+			// the shared list. op=add adds one address; op=del removes one. The
+			// updated authoritative list is returned as JSON.
+			op := r.URL.Query().Get("op")
+			addr := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("addr")))
+			if addr == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			if mailboxes == nil {
+				mailboxes = map[string]bool{}
+			}
+			switch op {
+			case "add":
+				mailboxes[addr] = true
+			case "del":
+				delete(mailboxes, addr)
+			default:
+				mu.Unlock()
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			list := make([]string, 0, len(mailboxes))
+			for k := range mailboxes {
+				list = append(list, k)
+			}
+			saveMailboxes(mailboxes)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(list)
+			fmt.Printf("Mailbox %s: %s (now %d)\n", op, addr, len(list))
 		case http.MethodPut:
 			// Client pushes the full authoritative list; replaces server state entirely.
 			var list []string
