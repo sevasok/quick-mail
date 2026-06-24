@@ -26,8 +26,10 @@ const (
 	cfAPI         = "https://api.cloudflare.com/client/v4"
 	serverVersion = "2"
 	githubRepo    = "sevasok/quick-mail"
-	version       = "1.0.0"
 )
+
+// version is set at build time via -ldflags "-X main.version=<tag>".
+var version = "dev"
 
 type Config struct {
 	VPSIP    string
