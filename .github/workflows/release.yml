@@ -30,7 +30,7 @@ jobs:
         env:
           GOOS: linux
           GOARCH: amd64
-        run: go build -ldflags="-s -w" -o quick-mail-server ./server
+        run: go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o quick-mail-server ./server
 
       - name: Create release
         uses: softprops/action-gh-release@v2

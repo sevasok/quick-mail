@@ -21,7 +21,8 @@ import (
 	"time"
 )
 
-const serverVersion = "5"
+// version is injected at build time via -ldflags "-X main.version=<tag>".
+var version = "dev"
 
 // adminTokenMinLen is the minimum length for a token to qualify as the admin
 // (owner) token. Guest tokens are deliberately shorter, so a guest token can
@@ -447,7 +448,7 @@ func authWithRate(w http.ResponseWriter, r *http.Request) bool {
 
 func startHTTP() {
 	http.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, serverVersion)
+		fmt.Fprint(w, version)
 	})
 
 	http.HandleFunc("/mail", func(w http.ResponseWriter, r *http.Request) {

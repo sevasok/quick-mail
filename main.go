@@ -25,7 +25,6 @@ const (
 	configFile    = "quick-mail.cfg"
 	mailboxesFile = "mailboxes.txt"
 	cfAPI         = "https://api.cloudflare.com/client/v4"
-	serverVersion = "5"
 	githubRepo    = "sevasok/quick-mail"
 )
 
@@ -546,18 +545,27 @@ func main() {
 	}
 	fmt.Println("ok")
 
-	// Version check and auto-deploy (admin) / auto-update client (guest).
-	if cfg.Guest {
-		// Guests auto-update their client binary to stay in sync with the server.
-		if v, err := checkServerVersion(baseURL); err == nil && v != serverVersion {
-			fmt.Printf("Server is version %s, updating client...\n", v)
-			updateAll(cfg)
-		}
-	} else {
-		if v, err := checkServerVersion(baseURL); err == nil && v != serverVersion {
-			fmt.Printf("Updating server (%s -> %s)...\n", v, serverVersion)
-			if err3 := deployServer(cfg); err3 != nil {
-				fmt.Println("Deploy error:", err3)
+	// Version check: compare server version against client version.
+	// Admin: redeploy the server if versions differ.
+	// Guest: self-update the client to match the server.
+	if sv, err := checkServerVersion(baseURL); err == nil && sv != "" && sv != "dev" && sv != version {
+		if cfg.Guest {
+			fmt.Printf("Server is v%s, client is v%s - updating...\n", sv, version)
+			tag := "v" + sv
+			_, assets, rerr := releaseByTag(tag)
+			if rerr != nil {
+				fmt.Println("Could not fetch release", tag+":", rerr)
+			} else if url, ok := assets["quick-mail.exe"]; !ok {
+				fmt.Println("No client binary in release", tag)
+			} else if err := selfUpdate(url); err != nil {
+				fmt.Println("Update error:", err)
+			} else {
+				fmt.Printf("Updated to %s. Restart quick-mail.\n", tag)
+			}
+		} else {
+			fmt.Printf("Updating server (%s -> %s)...\n", sv, version)
+			if err := deployServer(cfg); err != nil {
+				fmt.Println("Deploy error:", err)
 			} else {
 				time.Sleep(2 * time.Second)
 			}
@@ -1058,7 +1066,16 @@ func checkServerVersion(baseURL string) (string, error) {
 // latestRelease returns the latest release tag and a map of asset name to its
 // download URL from the GitHub releases API.
 func latestRelease() (tag string, assets map[string]string, err error) {
-	resp, err := http.Get("https://api.github.com/repos/" + githubRepo + "/releases/latest")
+	return releaseByURL("https://api.github.com/repos/" + githubRepo + "/releases/latest")
+}
+
+// releaseByTag fetches a specific release by tag name.
+func releaseByTag(tag string) (string, map[string]string, error) {
+	return releaseByURL("https://api.github.com/repos/" + githubRepo + "/releases/tags/" + tag)
+}
+
+func releaseByURL(url string) (tag string, assets map[string]string, err error) {
+	resp, err := http.Get(url)
 	if err != nil {
 		return "", nil, err
 	}
