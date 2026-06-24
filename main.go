@@ -25,6 +25,8 @@ const (
 	mailboxesFile = "mailboxes.txt"
 	cfAPI         = "https://api.cloudflare.com/client/v4"
 	serverVersion = "2"
+	githubRepo    = "sevasok/quick-mail"
+	version       = "1.0.0"
 )
 
 type Config struct {
@@ -279,8 +281,12 @@ func main() {
 	if ensureToken(&cfg) {
 		saveConfig(cfg)
 	}
+	// Clean up the previous executable left by a self-update.
+	if exe, err := os.Executable(); err == nil {
+		os.Remove(exe + ".old")
+	}
 
-	fmt.Println("Quick Mail")
+	fmt.Println("Quick Mail " + version)
 	fmt.Println()
 
 	firstRun := isFirstRun(cfg)
@@ -335,10 +341,8 @@ func main() {
 	if err := ping(baseURL, cfg.Token); err != nil {
 		fmt.Println("not reachable")
 		if !firstRun {
-			if _, err2 := os.Stat("quick-mail-server"); err2 == nil {
-				provisionVPS(r, &cfg)
-				time.Sleep(2 * time.Second)
-			}
+			provisionVPS(r, &cfg)
+			time.Sleep(2 * time.Second)
 		}
 		if err := ping(baseURL, cfg.Token); err != nil {
 			fmt.Println()
@@ -355,13 +359,11 @@ func main() {
 
 	// Version check: auto-deploy the updated binary on mismatch.
 	if v, err := checkServerVersion(baseURL); err == nil && v != serverVersion {
-		if _, err2 := os.Stat("quick-mail-server"); err2 == nil {
-			fmt.Printf("Updating server (%s -> %s)... \n", v, serverVersion)
-			if err3 := deployServer(cfg); err3 != nil {
-				fmt.Println("Deploy error:", err3)
-			} else {
-				time.Sleep(2 * time.Second)
-			}
+		fmt.Printf("Updating server (%s -> %s)...\n", v, serverVersion)
+		if err3 := deployServer(cfg); err3 != nil {
+			fmt.Println("Deploy error:", err3)
+		} else {
+			time.Sleep(2 * time.Second)
 		}
 	}
 
@@ -406,7 +408,7 @@ func main() {
 		fmt.Println("Mode: verified list")
 		fmt.Println("Commands: add <email>  |  del <email>  |  list")
 	}
-	fmt.Println("Global commands: clear (delete all mail)  |  deploy (re-deploy server binary)  |  setup (re-provision VPS)")
+	fmt.Println("Global commands: clear (delete all mail)  |  deploy (re-deploy server)  |  setup (re-provision VPS)  |  update (update client + server)")
 	fmt.Println("Listening for mail on *@" + cfg.Domain + " (Ctrl+C to stop)")
 	fmt.Println()
 
@@ -492,6 +494,8 @@ func main() {
 				if err := deployServer(cfg); err != nil {
 					fmt.Println("Deploy error:", err)
 				}
+			case "update":
+				updateAll(cfg)
 			case "init", "setup":
 				provisionVPS(r, &cfg)
 			}
@@ -755,12 +759,161 @@ func checkServerVersion(baseURL string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+// latestRelease returns the latest release tag and a map of asset name to its
+// download URL from the GitHub releases API.
+func latestRelease() (tag string, assets map[string]string, err error) {
+	resp, err := http.Get("https://api.github.com/repos/" + githubRepo + "/releases/latest")
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("GitHub API: %s", resp.Status)
+	}
+	var data struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name string `json:"name"`
+			URL  string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", nil, err
+	}
+	assets = map[string]string{}
+	for _, a := range data.Assets {
+		assets[a.Name] = a.URL
+	}
+	return data.TagName, assets, nil
+}
+
+// downloadTo fetches url and writes it to dest, replacing any existing file.
+func downloadTo(url, dest string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download: %s", resp.Status)
+	}
+	tmp := dest + ".download"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(f, resp.Body)
+	f.Close()
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	os.Remove(dest)
+	return os.Rename(tmp, dest)
+}
+
+// ensureServerBinary makes sure quick-mail-server exists locally, downloading the
+// latest released binary if it is missing.
+func ensureServerBinary() error {
+	if _, err := os.Stat("quick-mail-server"); err == nil {
+		return nil
+	}
+	fmt.Print("Downloading latest server binary... ")
+	_, assets, err := latestRelease()
+	if err != nil {
+		fmt.Println("failed")
+		return fmt.Errorf("server binary missing and release lookup failed: %w", err)
+	}
+	url, ok := assets["quick-mail-server"]
+	if !ok {
+		fmt.Println("failed")
+		return fmt.Errorf("server binary missing and not in latest release")
+	}
+	if err := downloadTo(url, "quick-mail-server"); err != nil {
+		fmt.Println("failed")
+		return err
+	}
+	fmt.Println("ok")
+	return nil
+}
+
+// selfUpdate replaces the running executable with the file at url. On Windows the
+// running exe is renamed aside (it cannot be overwritten) and cleaned up on next
+// launch. A restart is required to run the new version.
+func selfUpdate(url string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	newPath := exe + ".new"
+	if err := downloadTo(url, newPath); err != nil {
+		return err
+	}
+	oldPath := exe + ".old"
+	os.Remove(oldPath)
+	if err := os.Rename(exe, oldPath); err != nil {
+		os.Remove(newPath)
+		return err
+	}
+	if err := os.Rename(newPath, exe); err != nil {
+		os.Rename(oldPath, exe) // rollback
+		return err
+	}
+	return nil
+}
+
+// updateAll updates the server binary (and redeploys it) and the client itself to
+// the latest GitHub release.
+func updateAll(cfg Config) {
+	fmt.Println("Checking for updates...")
+	tag, assets, err := latestRelease()
+	if err != nil {
+		fmt.Println("Update check failed:", err)
+		return
+	}
+	latest := strings.TrimPrefix(tag, "v")
+	fmt.Printf("Latest release: %s (current client %s)\n", tag, version)
+
+	// Update and redeploy the server.
+	if url, ok := assets["quick-mail-server"]; ok {
+		fmt.Print("  Downloading server binary... ")
+		if err := downloadTo(url, "quick-mail-server"); err != nil {
+			fmt.Println("error:", err)
+		} else {
+			fmt.Println("ok")
+			if err := deployServer(cfg); err != nil {
+				fmt.Println("  Deploy error:", err)
+			}
+		}
+	} else {
+		fmt.Println("  No server binary in the latest release.")
+	}
+
+	// Update the client itself.
+	if latest == version {
+		fmt.Println("  Client is up to date.")
+		return
+	}
+	url, ok := assets["quick-mail.exe"]
+	if !ok {
+		fmt.Println("  No client binary in the latest release.")
+		return
+	}
+	fmt.Print("  Updating client to " + tag + "... ")
+	if err := selfUpdate(url); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("ok")
+	fmt.Println("  Client updated. Restart quick-mail to use " + tag + ".")
+}
+
 // provisionVPS connects to the VPS with the SSH key, runs one-time setup if the
 // systemd service is missing, then deploys the current server binary. It is the
 // single entry point for getting the server running, with no manual choices.
 func provisionVPS(r *bufio.Reader, cfg *Config) {
-	if _, err := os.Stat("quick-mail-server"); err != nil {
-		fmt.Println("quick-mail-server binary not found next to quick-mail.exe.")
+	if err := ensureServerBinary(); err != nil {
+		fmt.Println(err)
 		return
 	}
 
@@ -884,8 +1037,8 @@ func oneTimeSetup(client *gossh.Client, cfg Config) error {
 
 // deployServer connects with the SSH key and deploys. Used by the 'deploy' command.
 func deployServer(cfg Config) error {
-	if _, err := os.Stat("quick-mail-server"); err != nil {
-		return fmt.Errorf("quick-mail-server binary not found in current directory")
+	if err := ensureServerBinary(); err != nil {
+		return err
 	}
 	client, err := sshConnectCfg(cfg)
 	if err != nil {
