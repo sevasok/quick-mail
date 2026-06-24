@@ -232,8 +232,10 @@ func setupWizard(r *bufio.Reader, cfg *Config) {
 	ensureToken(cfg)
 	fmt.Println()
 
-	// Provision the VPS automatically (one-time setup if needed, then deploy).
-	if _, err := os.Stat("quick-mail-server"); err == nil {
+	// Provision the VPS automatically (downloads the server binary if needed,
+	// runs one-time setup, then deploys). Always run so the VPS is fully
+	// configured regardless of later optional steps.
+	if cfg.VPSIP != "" {
 		provisionVPS(r, cfg)
 		fmt.Println()
 	}
@@ -349,7 +351,7 @@ func main() {
 		if err := ping(baseURL, cfg.Token); err != nil {
 			fmt.Println()
 			fmt.Println("The server is running but its port is not reachable from here.")
-			fmt.Println("Open these inbound ports in your VPS firewall (Webdock dashboard > Firewall):")
+			fmt.Println("Open these inbound ports in your VPS provider's firewall:")
 			fmt.Println("  TCP " + cfg.VPSPort + "  (quick-mail API)")
 			fmt.Println("  TCP 25    (SMTP, to receive mail)")
 			fmt.Println("Then run quick-mail again.")
@@ -615,20 +617,6 @@ var sshPassCache string
 // errKeyNotAuthorized means the server accepted the connection but rejected our
 // public key, i.e. the key is not in the server's authorized_keys.
 var errKeyNotAuthorized = fmt.Errorf("ssh key not authorized on server")
-
-// sshKeyInfo returns the public key's comment (name) and SHA256 fingerprint by
-// reading the companion .pub file. Missing fields are returned empty.
-func sshKeyInfo(keyPath string) (name, fingerprint string) {
-	data, err := os.ReadFile(keyPath + ".pub")
-	if err != nil {
-		return "", ""
-	}
-	pub, comment, _, _, err := gossh.ParseAuthorizedKey(data)
-	if err != nil {
-		return "", ""
-	}
-	return comment, gossh.FingerprintSHA256(pub)
-}
 
 func readPassword(prompt string) string {
 	fmt.Print(prompt + ": ")
@@ -962,27 +950,32 @@ func provisionVPS(r *bufio.Reader, cfg *Config) {
 	}
 }
 
-// guideAuthorizeKey prints the one precise step needed to authorize the SSH key
-// after a server reset, optionally opens the Webdock dashboard, and waits for the
-// user to retry. Returns false if the user chooses to stop.
+// guideAuthorizeKey prints the public key the user must add to the server
+// after a server reset, and waits for the user to retry. Returns false if the
+// user chooses to stop.
 func guideAuthorizeKey(r *bufio.Reader, cfg Config) bool {
-	name, fp := sshKeyInfo(cfg.SSHKey)
+	pubLine := sshPublicKeyLine(cfg.SSHKey)
 	fmt.Println()
 	fmt.Println("Your SSH key is not authorized on the server (it was likely reset).")
-	fmt.Println("Assign this key to the server in the Webdock dashboard:")
-	if name != "" {
-		fmt.Println("  Key name:    " + name)
-	}
-	if fp != "" {
-		fmt.Println("  Fingerprint: " + fp)
-	}
-	fmt.Println("  Server > Shell Users > admin > Assign Public Keys > Assign Keys")
+	fmt.Println("Add this public key to the server (your VPS provider's dashboard, or")
+	fmt.Println("~/.ssh/authorized_keys for user " + cfg.SSHUser + "). Copy the whole line:")
 	fmt.Println()
-	if strings.ToLower(promptLine(r, "Open the Webdock dashboard now? (y/n)", "y")) == "y" {
-		openURL("https://webdock.io/en/dash")
+	if pubLine != "" {
+		fmt.Println(pubLine)
 	}
-	ans := promptLine(r, "Press Enter after assigning the key to retry (or type 'skip')", "")
+	fmt.Println()
+	ans := promptLine(r, "Press Enter after adding the key to retry (or type 'skip')", "")
 	return strings.ToLower(strings.TrimSpace(ans)) != "skip"
+}
+
+// sshPublicKeyLine returns the full single-line public key (the contents of
+// <keyPath>.pub) for the user to copy and paste verbatim.
+func sshPublicKeyLine(keyPath string) string {
+	data, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // oneTimeSetup configures passwordless sudo (setcap + systemctl) and installs the

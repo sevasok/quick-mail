@@ -1,13 +1,16 @@
 # Binaries
 quick-mail.exe
 quick-mail-server
+sokolabs-server
 
 # Config and personal data
 quick-mail.cfg
 mailboxes.txt
+sokolabs-mail.cfg
 
 # Go build artifacts
 *.exe
+*.exe~
 *.test
 *.out
 
