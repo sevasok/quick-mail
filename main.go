@@ -615,13 +615,13 @@ func main() {
 	fmt.Println()
 	printHelp := func() {
 		if cfg.Guest {
-			fmt.Println("Commands: add <email>  |  del <email>  |  del all  |  list  |  sync  |  clear  |  setup  |  help")
+			fmt.Println("Commands: add <email>  |  del <email>  |  del all (remove all addresses)  |  list  |  sync  |  clear (delete received mail)  |  setup  |  help")
 		} else if cfg.CatchAll {
 			fmt.Println("Mode: catch-all (accepting all addresses)")
-			fmt.Println("Commands: clear  |  deploy  |  setup  |  update  |  guest <name>  |  guests  |  revoke <name|token>  |  revoke all  |  help")
+			fmt.Println("Commands: clear (delete received mail)  |  deploy  |  setup  |  update  |  guest <name>  |  guests  |  revoke <name|token>  |  revoke all  |  help")
 		} else {
 			fmt.Println("Mode: verified list")
-			fmt.Println("Commands: add <email>  |  del <email>  |  del all  |  list  |  sync  |  clear  |  deploy  |  setup  |  update  |  guest <name>  |  guests  |  revoke <name|token>  |  revoke all  |  help")
+			fmt.Println("Commands: add <email>  |  del <email>  |  del all (remove all addresses)  |  list  |  sync  |  clear (delete received mail)  |  deploy  |  setup  |  update  |  guest <name>  |  guests  |  revoke <name|token>  |  revoke all  |  help")
 		}
 	}
 	printHelp()
@@ -661,10 +661,19 @@ func main() {
 				}
 			case "del":
 				if arg != "" && strings.ToLower(arg) == "all" {
-					if err := clearInbox(baseURL, cfg.Token); err != nil {
-						fmt.Println("Error:", err)
-					} else {
-						fmt.Println("All emails deleted.")
+					list, err := syncMailboxes(baseURL, cfg.Token)
+					if err != nil {
+						fmt.Println("Error syncing:", err)
+						continue
+					}
+					for _, addr := range list {
+						updated, aerr := changeMailbox(baseURL, cfg.Token, "del", addr)
+						if aerr != nil {
+							fmt.Println("Error removing", addr+":", aerr)
+						} else {
+							saveLocalMailboxes(updated)
+							fmt.Println("Removed:", addr)
+						}
 					}
 					continue
 				}
@@ -1026,7 +1035,13 @@ func clearInbox(baseURL, token string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("wrong token")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned %d", resp.StatusCode)
+	}
 	return nil
 }
 
