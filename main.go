@@ -24,9 +24,14 @@ const (
 	configFile    = "quick-mail.cfg"
 	mailboxesFile = "mailboxes.txt"
 	cfAPI         = "https://api.cloudflare.com/client/v4"
-	serverVersion = "2"
+	serverVersion = "3"
 	githubRepo    = "sevasok/quick-mail"
 )
+
+// apiClient is used for short-lived server API calls (poll, push, clear,
+// version). The timeout prevents a single hung request from stalling a client
+// while others poll the same shared inbox concurrently.
+var apiClient = &http.Client{Timeout: 30 * time.Second}
 
 // version is set at build time via -ldflags "-X main.version=<tag>".
 var version = "dev"
@@ -164,7 +169,7 @@ func pushMailboxes(baseURL, token string, list []string) error {
 	body, _ := json.Marshal(list)
 	req, _ := http.NewRequest(http.MethodPut, baseURL+"/mailboxes?token="+token, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -531,7 +536,7 @@ func ping(baseURL, token string) error {
 
 func fetchMail(baseURL, token string, after int64) ([]Email, error) {
 	url := fmt.Sprintf("%s/mail?after=%d&token=%s", baseURL, after, token)
-	resp, err := http.Get(url)
+	resp, err := apiClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -731,7 +736,7 @@ func clearInbox(baseURL, token string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -740,7 +745,7 @@ func clearInbox(baseURL, token string) error {
 }
 
 func checkServerVersion(baseURL string) (string, error) {
-	resp, err := http.Get(baseURL + "/version")
+	resp, err := apiClient.Get(baseURL + "/version")
 	if err != nil {
 		return "", err
 	}
@@ -928,6 +933,16 @@ func provisionVPS(r *bufio.Reader, cfg *Config) {
 	}
 	defer client.Close()
 
+	// Adopt the server's existing token if it already has one. On a shared
+	// server, the first person to set it up defines the token; everyone after
+	// must reuse it instead of overwriting it (which would invalidate the
+	// others). Only push our own token when the server has none yet.
+	if existing := readServerToken(client, *cfg); existing != "" && existing != cfg.Token {
+		cfg.Token = existing
+		saveConfig(*cfg)
+		fmt.Println("Using the server's existing shared token.")
+	}
+
 	// One-time setup if the service or a valid root-owned sudoers rule is missing,
 	// or if passwordless ufw is not yet available (older sudoers without ufw).
 	needSetup := false
@@ -1043,6 +1058,24 @@ func deployServer(cfg Config) error {
 	return deployWith(client, cfg)
 }
 
+// readServerToken returns the TOKEN currently configured on the server (from its
+// env file), or "" if the server has none yet. Used to adopt a shared token so
+// multiple people on one server keep working without re-running setup.
+func readServerToken(client *gossh.Client, cfg Config) string {
+	home := "/home/" + cfg.SSHUser
+	out, err := sshRun(client, "cat "+home+"/quick-mail.env 2>/dev/null")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "TOKEN=") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "TOKEN="))
+		}
+	}
+	return ""
+}
+
 // deployWith writes the token env file, uploads the binary, applies setcap, and
 // restarts the systemd service. All privileged steps are passwordless after
 // oneTimeSetup. Falls back to nohup if the service is not installed.
@@ -1051,13 +1084,16 @@ func deployWith(client *gossh.Client, cfg Config) error {
 	remoteBin := home + "/quick-mail-server"
 	remoteTmp := home + "/quick-mail-server.tmp"
 
-	// Token env file (no sudo needed; owned by the user).
-	fmt.Print("  Syncing token... ")
-	if err := sshRunIn(client, "sh -c 'cat > "+home+"/quick-mail.env && chmod 600 "+home+"/quick-mail.env'",
-		"TOKEN="+cfg.Token+"\n"); err != nil {
-		return fmt.Errorf("write env: %w", err)
+	// Token env file. Only write it when the server has no token yet, so a later
+	// client on a shared server never clobbers the established shared token.
+	if readServerToken(client, cfg) == "" {
+		fmt.Print("  Setting token... ")
+		if err := sshRunIn(client, "sh -c 'cat > "+home+"/quick-mail.env && chmod 600 "+home+"/quick-mail.env'",
+			"TOKEN="+cfg.Token+"\n"); err != nil {
+			return fmt.Errorf("write env: %w", err)
+		}
+		fmt.Println("ok")
 	}
-	fmt.Println("ok")
 
 	fmt.Print("  Uploading binary... ")
 	if err := sshUpload(client, "quick-mail-server", remoteTmp); err != nil {

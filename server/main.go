@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const serverVersion = "2"
+const serverVersion = "3"
 
 type Email struct {
 	ID      int64    `json:"id"`
@@ -136,7 +136,10 @@ func handleSMTP(conn net.Conn) {
 
 func doSession(rw net.Conn, upgraded bool) {
 	r := bufio.NewReader(rw)
-	write := func(s string) { rw.Write([]byte(s + "\r\n")) }
+	write := func(s string) {
+		rw.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		rw.Write([]byte(s + "\r\n"))
+	}
 
 	if !upgraded {
 		write("220 " + hostname + " ESMTP")
@@ -148,6 +151,9 @@ func doSession(rw net.Conn, upgraded bool) {
 	collecting := false
 
 	for {
+		// Refresh the deadline on each command so a stalled peer cannot hold the
+		// connection (and its goroutine) open indefinitely under concurrent load.
+		rw.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		line, err := r.ReadString('\n')
 		if err != nil {
 			return
@@ -396,5 +402,14 @@ func startHTTP() {
 		}
 	})
 	fmt.Println("HTTP API listening on :8080")
-	http.ListenAndServe(":8080", nil)
+	// Explicit timeouts keep many concurrent clients (polling and pushing at the
+	// same time) from exhausting sockets via slow or stuck connections.
+	srv := &http.Server{
+		Addr:              ":8080",
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	srv.ListenAndServe()
 }
