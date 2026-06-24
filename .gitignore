@@ -1,9 +1,9 @@
 # Binaries
-sokolabs-mail.exe
-sokolabs-server
+quick-mail.exe
+quick-mail-server
 
 # Config and personal data
-sokolabs-mail.cfg
+quick-mail.cfg
 mailboxes.txt
 
 # Go build artifacts

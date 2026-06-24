@@ -3,12 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -17,7 +21,7 @@ import (
 )
 
 const (
-	configFile    = "sokolabs-mail.cfg"
+	configFile    = "quick-mail.cfg"
 	mailboxesFile = "mailboxes.txt"
 	cfAPI         = "https://api.cloudflare.com/client/v4"
 	serverVersion = "2"
@@ -164,6 +168,27 @@ func pushMailboxes(baseURL, token string, list []string) error {
 	return nil
 }
 
+func randomToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "changeme"
+	}
+	return hex.EncodeToString(b)
+}
+
+func openURL(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	cmd.Start()
+}
+
 func promptLine(r *bufio.Reader, label, saved string) string {
 	if saved != "" {
 		fmt.Printf("%s [%s]: ", label, saved)
@@ -182,6 +207,17 @@ func isFirstRun(cfg Config) bool {
 	return cfg.VPSIP == "" || cfg.Token == ""
 }
 
+// ensureToken guarantees cfg.Token holds a real secret. Empty values and known
+// placeholders are replaced with a freshly generated random token.
+func ensureToken(cfg *Config) bool {
+	switch cfg.Token {
+	case "", "auto-generated", "changeme", "mysecrettoken":
+		cfg.Token = randomToken()
+		return true
+	}
+	return false
+}
+
 func setupWizard(r *bufio.Reader, cfg *Config) {
 	fmt.Println("=== First-time setup ===")
 	fmt.Println()
@@ -189,51 +225,25 @@ func setupWizard(r *bufio.Reader, cfg *Config) {
 	// Step 1: VPS server
 	fmt.Println("Step 1: VPS server")
 	cfg.VPSIP = promptLine(r, "  VPS IP address", cfg.VPSIP)
-	if cfg.Token == "" {
-		cfg.Token = "mysecrettoken"
-	}
-	cfg.Token = promptLine(r, "  Shared token (set as TOKEN= when starting server)", cfg.Token)
+	ensureToken(cfg)
 	fmt.Println()
 
-	// Deploy and init
-	if _, err := os.Stat("sokolabs-server"); err == nil {
-		fmt.Println("  Found sokolabs-server binary in current directory.")
-		fmt.Println()
-		fmt.Println("  1) Init VPS (SSH with password - sets up setcap + optional systemd service)")
-		fmt.Println("  2) Deploy binary only (SSH with key - assumes init already done)")
-		fmt.Println("  3) Skip")
-		choice := promptLine(r, "  Choice", "1")
-		switch strings.TrimSpace(choice) {
-		case "1":
-			cfg.SSHUser = promptLine(r, "  SSH user", cfg.SSHUser)
-			cfg.SSHKey = promptLine(r, "  SSH key path (for future deploys)", cfg.SSHKey)
-			initVPS(r, cfg)
-			fmt.Print("  Deploying server binary... ")
-			if err := deployServer(*cfg); err != nil {
-				fmt.Println("Error:", err)
-			} else {
-				fmt.Println("ok")
-			}
-		case "2":
-			cfg.SSHUser = promptLine(r, "  SSH user", cfg.SSHUser)
-			cfg.SSHKey = promptLine(r, "  SSH key path", cfg.SSHKey)
-			fmt.Println()
-			if err := deployServer(*cfg); err != nil {
-				fmt.Println("  Deploy error:", err)
-			} else {
-				fmt.Println("  Server deployed successfully.")
-			}
-		}
+	// Provision the VPS automatically (one-time setup if needed, then deploy).
+	if _, err := os.Stat("quick-mail-server"); err == nil {
+		provisionVPS(r, cfg)
 		fmt.Println()
 	}
 
 	// Step 2: Cloudflare DNS
 	fmt.Println("Step 2: Cloudflare DNS (optional but recommended)")
 	fmt.Println("  This auto-configures MX, SPF and DMARC records and detects your domain.")
-	fmt.Println("  Create a token at: https://dash.cloudflare.com/profile/api-tokens")
-	fmt.Println("  Required permissions: Zone > DNS > Edit, Zone > Zone > Read")
+	fmt.Println("  Required token permissions: Zone > DNS > Edit, Zone > Zone > Read")
 	fmt.Println("  Hint: use the 'Edit zone DNS' template, then add Zone:Read.")
 	fmt.Println()
+	openTok := promptLine(r, "  Open the Cloudflare token page in your browser now? (y/n)", "y")
+	if strings.ToLower(openTok) == "y" {
+		openURL("https://dash.cloudflare.com/profile/api-tokens")
+	}
 	cfg.CFToken = promptLine(r, "  Cloudflare API token (press Enter to skip)", cfg.CFToken)
 	if cfg.CFToken != "" {
 		fmt.Print("  Detecting domain from Cloudflare... ")
@@ -266,6 +276,9 @@ func setupWizard(r *bufio.Reader, cfg *Config) {
 func main() {
 	r := bufio.NewReader(os.Stdin)
 	cfg := loadConfig()
+	if ensureToken(&cfg) {
+		saveConfig(cfg)
+	}
 
 	fmt.Println("Quick Mail")
 	fmt.Println()
@@ -316,42 +329,38 @@ func main() {
 
 	baseURL := "http://" + cfg.VPSIP + ":" + cfg.VPSPort
 
-	// Check connectivity
+	// Check connectivity; if unreachable, provision the VPS automatically.
+	// The first-run wizard already provisioned, so don't provision twice.
 	fmt.Print("Connecting to VPS... ")
 	if err := ping(baseURL, cfg.Token); err != nil {
-		fmt.Println("FAILED")
-		fmt.Println()
-		fmt.Println("Cannot reach the server. Make sure it is running:")
-		fmt.Println("  chmod +x ./sokolabs-server")
-		fmt.Println("  sudo setcap 'cap_net_bind_service=+ep' ./sokolabs-server")
-		fmt.Println("  TOKEN=" + cfg.Token + " nohup ./sokolabs-server >> mailserver.log 2>&1 &")
-		fmt.Println()
-		if _, err2 := os.Stat("sokolabs-server"); err2 == nil {
-			fmt.Print("Deploy sokolabs-server to VPS now? (y/n): ")
-			yn, _ := r.ReadString('\n')
-			if strings.ToLower(strings.TrimSpace(yn)) == "y" {
-				if err3 := deployServer(cfg); err3 != nil {
-					fmt.Println("Deploy error:", err3)
-				}
+		fmt.Println("not reachable")
+		if !firstRun {
+			if _, err2 := os.Stat("quick-mail-server"); err2 == nil {
+				provisionVPS(r, &cfg)
+				time.Sleep(2 * time.Second)
 			}
 		}
-		pause(r)
-		return
+		if err := ping(baseURL, cfg.Token); err != nil {
+			fmt.Println()
+			fmt.Println("The server is running but its port is not reachable from here.")
+			fmt.Println("Open these inbound ports in your VPS firewall (Webdock dashboard > Firewall):")
+			fmt.Println("  TCP " + cfg.VPSPort + "  (quick-mail API)")
+			fmt.Println("  TCP 25    (SMTP, to receive mail)")
+			fmt.Println("Then run quick-mail again.")
+			pause(r)
+			return
+		}
 	}
 	fmt.Println("ok")
 
-	// Version check
+	// Version check: auto-deploy the updated binary on mismatch.
 	if v, err := checkServerVersion(baseURL); err == nil && v != serverVersion {
-		fmt.Printf("Warning: server version %q, client expects %q\n", v, serverVersion)
-		if _, err2 := os.Stat("sokolabs-server"); err2 == nil {
-			fmt.Print("Deploy updated server now? (y/n): ")
-			yn, _ := r.ReadString('\n')
-			if strings.ToLower(strings.TrimSpace(yn)) == "y" {
-				if err3 := deployServer(cfg); err3 != nil {
-					fmt.Println("Deploy error:", err3)
-				} else {
-					time.Sleep(2 * time.Second)
-				}
+		if _, err2 := os.Stat("quick-mail-server"); err2 == nil {
+			fmt.Printf("Updating server (%s -> %s)... \n", v, serverVersion)
+			if err3 := deployServer(cfg); err3 != nil {
+				fmt.Println("Deploy error:", err3)
+			} else {
+				time.Sleep(2 * time.Second)
 			}
 		}
 	}
@@ -397,7 +406,7 @@ func main() {
 		fmt.Println("Mode: verified list")
 		fmt.Println("Commands: add <email>  |  del <email>  |  list")
 	}
-	fmt.Println("Global commands: clear (delete all mail)  |  deploy (re-deploy server binary)  |  init (SSH init/setup VPS)")
+	fmt.Println("Global commands: clear (delete all mail)  |  deploy (re-deploy server binary)  |  setup (re-provision VPS)")
 	fmt.Println("Listening for mail on *@" + cfg.Domain + " (Ctrl+C to stop)")
 	fmt.Println()
 
@@ -483,8 +492,8 @@ func main() {
 				if err := deployServer(cfg); err != nil {
 					fmt.Println("Deploy error:", err)
 				}
-			case "init":
-				initVPS(r, &cfg)
+			case "init", "setup":
+				provisionVPS(r, &cfg)
 			}
 		nextCmd:
 		}
@@ -597,6 +606,24 @@ func upsertTXT(token, zid, name, content string) error {
 
 var sshPassCache string
 
+// errKeyNotAuthorized means the server accepted the connection but rejected our
+// public key, i.e. the key is not in the server's authorized_keys.
+var errKeyNotAuthorized = fmt.Errorf("ssh key not authorized on server")
+
+// sshKeyInfo returns the public key's comment (name) and SHA256 fingerprint by
+// reading the companion .pub file. Missing fields are returned empty.
+func sshKeyInfo(keyPath string) (name, fingerprint string) {
+	data, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		return "", ""
+	}
+	pub, comment, _, _, err := gossh.ParseAuthorizedKey(data)
+	if err != nil {
+		return "", ""
+	}
+	return comment, gossh.FingerprintSHA256(pub)
+}
+
 func readPassword(prompt string) string {
 	fmt.Print(prompt + ": ")
 	b, err := term.ReadPassword(int(os.Stdin.Fd()))
@@ -643,15 +670,19 @@ func sshRunIn(client *gossh.Client, cmd, stdin string) error {
 	return sess.Run(cmd)
 }
 
-// sshSudoRun runs cmd via "sudo -S cmd" using sudoPass for authentication.
+// sshSudoRun runs cmd via sudo. It tries passwordless sudo first, then falls
+// back to "sudo -S" using sudoPass for authentication.
 func sshSudoRun(client *gossh.Client, cmd, sudoPass string) (string, error) {
+	if out, err := sshRun(client, "sudo -n "+cmd); err == nil {
+		return out, nil
+	}
 	sess, err := client.NewSession()
 	if err != nil {
 		return "", err
 	}
 	defer sess.Close()
 	sess.Stdin = strings.NewReader(sudoPass + "\n")
-	out, err := sess.CombinedOutput("sudo -S " + cmd)
+	out, err := sess.CombinedOutput("sudo -S -p '' " + cmd)
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -678,17 +709,27 @@ func sshConnectCfg(cfg Config) (*gossh.Client, error) {
 	}
 	signer, err := gossh.ParsePrivateKey(keyData)
 	if err != nil {
-		// key has a passphrase
-		if sshPassCache == "" {
-			sshPassCache = readPassword("SSH key passphrase")
-		}
-		signer, err = gossh.ParsePrivateKeyWithPassphrase(keyData, []byte(sshPassCache))
-		if err != nil {
+		// key has a passphrase; try the cached one, then prompt (up to 3 tries)
+		for attempt := 0; attempt < 3; attempt++ {
+			if sshPassCache == "" {
+				sshPassCache = readPassword("  SSH key passphrase")
+			}
+			signer, err = gossh.ParsePrivateKeyWithPassphrase(keyData, []byte(sshPassCache))
+			if err == nil {
+				break
+			}
+			fmt.Println("  Wrong passphrase, try again.")
 			sshPassCache = ""
-			return nil, fmt.Errorf("parse SSH key: %w", err)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("could not unlock SSH key %s", cfg.SSHKey)
 		}
 	}
-	return sshDial(cfg.VPSIP, cfg.SSHUser, []gossh.AuthMethod{gossh.PublicKeys(signer)})
+	client, err := sshDial(cfg.VPSIP, cfg.SSHUser, []gossh.AuthMethod{gossh.PublicKeys(signer)})
+	if err != nil && strings.Contains(err.Error(), "unable to authenticate") {
+		return nil, errKeyNotAuthorized
+	}
+	return client, err
 }
 
 func clearInbox(baseURL, token string) error {
@@ -714,109 +755,192 @@ func checkServerVersion(baseURL string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
-func initVPS(r *bufio.Reader, cfg *Config) {
-	fmt.Println()
-	fmt.Println("=== VPS Init ===")
-	fmt.Println("Connects to your VPS with a password and sets up:")
-	fmt.Println("  - Passwordless sudo for setcap (lets the server bind port 25)")
-	fmt.Println("  - Systemd service for auto-start on reboot (optional)")
-	fmt.Println()
+// provisionVPS connects to the VPS with the SSH key, runs one-time setup if the
+// systemd service is missing, then deploys the current server binary. It is the
+// single entry point for getting the server running, with no manual choices.
+func provisionVPS(r *bufio.Reader, cfg *Config) {
+	if _, err := os.Stat("quick-mail-server"); err != nil {
+		fmt.Println("quick-mail-server binary not found next to quick-mail.exe.")
+		return
+	}
 
-	cfg.SSHUser = promptLine(r, "SSH user", cfg.SSHUser)
-	pass := readPassword("SSH/sudo password")
-
-	fmt.Print("Connecting... ")
-	client, err := sshDial(cfg.VPSIP, cfg.SSHUser, []gossh.AuthMethod{gossh.Password(pass)})
-	if err != nil {
-		fmt.Println("FAILED:", err)
+	var client *gossh.Client
+	for {
+		fmt.Print("Connecting to VPS (SSH key)... ")
+		c, err := sshConnectCfg(*cfg)
+		if err == nil {
+			client = c
+			fmt.Println("ok")
+			break
+		}
+		fmt.Println("FAILED")
+		if err == errKeyNotAuthorized {
+			if !guideAuthorizeKey(r, *cfg) {
+				return
+			}
+			continue
+		}
+		fmt.Println("  " + err.Error())
 		return
 	}
 	defer client.Close()
-	fmt.Println("ok")
 
-	// Sudoers rule: write to /tmp (no sudo), then move into place with sudo
-	fmt.Print("Setting up setcap permissions... ")
-	if err := sshRunIn(client, "cat > /tmp/sokolabs-setcap",
-		cfg.SSHUser+" ALL=(ALL) NOPASSWD: /usr/sbin/setcap\n"); err != nil {
-		fmt.Println("Warning (write tmp):", err)
-	} else {
-		out, err := sshSudoRun(client,
-			"sh -c 'mv /tmp/sokolabs-setcap /etc/sudoers.d/sokolabs-setcap && chmod 440 /etc/sudoers.d/sokolabs-setcap'",
-			pass)
-		if err != nil {
-			fmt.Printf("Warning: %v", err)
-			if out != "" {
-				fmt.Printf(" (%s)", out)
-			}
-			fmt.Println()
-		} else {
-			fmt.Println("ok")
+	// One-time setup if the service or a valid root-owned sudoers rule is missing,
+	// or if passwordless ufw is not yet available (older sudoers without ufw).
+	needSetup := false
+	if _, err := sshRun(client, "test -f /etc/systemd/system/quick-mail-server.service"); err != nil {
+		needSetup = true
+	} else if _, err := sshRun(client, `test "$(stat -c %u /etc/sudoers.d/quick-mail 2>/dev/null)" = "0"`); err != nil {
+		needSetup = true
+	} else if _, err := sshRun(client, "sudo -n /usr/sbin/ufw status >/dev/null 2>&1"); err != nil {
+		needSetup = true
+	}
+	if needSetup {
+		if err := oneTimeSetup(client, *cfg); err != nil {
+			fmt.Println("Setup error:", err)
+			return
 		}
 	}
 
-	// Systemd service
-	doSvc := promptLine(r, "Install systemd service for auto-start on reboot? (y/n)", "y")
-	if strings.ToLower(doSvc) == "y" {
-		fmt.Print("Installing systemd service... ")
-		svcHome := "/home/" + cfg.SSHUser
-		svc := "[Unit]\nDescription=Quick Mail Server\nAfter=network.target\n\n" +
-			"[Service]\nType=simple\nUser=" + cfg.SSHUser + "\nWorkingDirectory=" + svcHome + "\n" +
-			"Environment=TOKEN=" + cfg.Token + "\n" +
-			"ExecStart=" + svcHome + "/sokolabs-server\nRestart=always\nRestartSec=5\n\n" +
-			"[Install]\nWantedBy=multi-user.target\n"
-
-		// Write service file to /tmp (no sudo needed)
-		if err := sshRunIn(client, "cat > /tmp/sokolabs-server.service", svc); err != nil {
-			fmt.Println("Warning (write tmp):", err)
-		} else {
-			out, err := sshSudoRun(client,
-				"sh -c 'mv /tmp/sokolabs-server.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable sokolabs-server'",
-				pass)
-			if err != nil {
-				fmt.Printf("Warning: %v", err)
-				if out != "" {
-					fmt.Printf(" (%s)", out)
-				}
-				fmt.Println()
-			} else {
-				fmt.Println("ok")
-			}
-		}
+	if err := deployWith(client, *cfg); err != nil {
+		fmt.Println("Deploy error:", err)
 	}
-
-	fmt.Println()
-	fmt.Println("Init complete. Use 'deploy' to push the server binary.")
 }
 
-func deployServer(cfg Config) error {
-	home := "/home/" + cfg.SSHUser
-	remoteBin := home + "/sokolabs-server"
-	remoteTmp := home + "/sokolabs-server2"
-
-	if _, err := os.Stat("sokolabs-server"); err != nil {
-		return fmt.Errorf("sokolabs-server binary not found in current directory")
+// guideAuthorizeKey prints the one precise step needed to authorize the SSH key
+// after a server reset, optionally opens the Webdock dashboard, and waits for the
+// user to retry. Returns false if the user chooses to stop.
+func guideAuthorizeKey(r *bufio.Reader, cfg Config) bool {
+	name, fp := sshKeyInfo(cfg.SSHKey)
+	fmt.Println()
+	fmt.Println("Your SSH key is not authorized on the server (it was likely reset).")
+	fmt.Println("Assign this key to the server in the Webdock dashboard:")
+	if name != "" {
+		fmt.Println("  Key name:    " + name)
 	}
+	if fp != "" {
+		fmt.Println("  Fingerprint: " + fp)
+	}
+	fmt.Println("  Server > Shell Users > admin > Assign Public Keys > Assign Keys")
+	fmt.Println()
+	if strings.ToLower(promptLine(r, "Open the Webdock dashboard now? (y/n)", "y")) == "y" {
+		openURL("https://webdock.io/en/dash")
+	}
+	ans := promptLine(r, "Press Enter after assigning the key to retry (or type 'skip')", "")
+	return strings.ToLower(strings.TrimSpace(ans)) != "skip"
+}
 
+// oneTimeSetup configures passwordless sudo (setcap + systemctl) and installs the
+// systemd unit. It asks for the sudo password once.
+func oneTimeSetup(client *gossh.Client, cfg Config) error {
+	fmt.Println("First-time server setup (one sudo password needed).")
+	pass := readPassword("  Sudo password for " + cfg.SSHUser)
+	home := "/home/" + cfg.SSHUser
+
+	// Passwordless sudo for the few commands deploy needs.
+	sudoers := cfg.SSHUser + " ALL=(ALL) NOPASSWD: /usr/sbin/setcap, " +
+		"/usr/sbin/ufw, " +
+		"/usr/bin/systemctl restart quick-mail-server, " +
+		"/usr/bin/systemctl start quick-mail-server, " +
+		"/usr/bin/systemctl stop quick-mail-server, " +
+		"/usr/bin/systemctl status quick-mail-server\n"
+	fmt.Print("  Configuring passwordless sudo... ")
+	if err := sshRunIn(client, "cat > /tmp/quick-mail-sudoers", sudoers); err != nil {
+		return fmt.Errorf("write sudoers: %w", err)
+	}
+	if out, err := sshSudoRun(client,
+		"sh -c 'mv /tmp/quick-mail-sudoers /etc/sudoers.d/quick-mail && chown root:root /etc/sudoers.d/quick-mail && chmod 440 /etc/sudoers.d/quick-mail'",
+		pass); err != nil {
+		return fmt.Errorf("install sudoers: %s", strings.TrimSpace(out+" "+err.Error()))
+	}
+	fmt.Println("ok")
+
+	// Systemd unit reads the token from an EnvironmentFile in the home dir.
+	fmt.Print("  Installing systemd service... ")
+	unit := "[Unit]\nDescription=Quick Mail Server\nAfter=network.target\n\n" +
+		"[Service]\nType=simple\nUser=" + cfg.SSHUser + "\nWorkingDirectory=" + home + "\n" +
+		"EnvironmentFile=" + home + "/quick-mail.env\n" +
+		"ExecStart=" + home + "/quick-mail-server\nRestart=always\nRestartSec=5\n\n" +
+		"[Install]\nWantedBy=multi-user.target\n"
+	if err := sshRunIn(client, "cat > /tmp/quick-mail-server.service", unit); err != nil {
+		return fmt.Errorf("write unit: %w", err)
+	}
+	if out, err := sshSudoRun(client,
+		"sh -c 'mv /tmp/quick-mail-server.service /etc/systemd/system/ && chown root:root /etc/systemd/system/quick-mail-server.service && systemctl daemon-reload && systemctl enable quick-mail-server'",
+		pass); err != nil {
+		return fmt.Errorf("install unit: %s", strings.TrimSpace(out+" "+err.Error()))
+	}
+	fmt.Println("ok")
+
+	// Open the required ports in the host firewall (ufw), if it is active.
+	fmt.Print("  Opening firewall ports (25, " + cfg.VPSPort + ")... ")
+	if _, err := sshSudoRun(client, "sh -c 'command -v ufw >/dev/null && ufw status | grep -q active && (ufw allow 25/tcp; ufw allow "+cfg.VPSPort+"/tcp) || true'", pass); err != nil {
+		fmt.Println("skipped (" + err.Error() + ")")
+	} else {
+		fmt.Println("ok")
+	}
+	return nil
+}
+
+// deployServer connects with the SSH key and deploys. Used by the 'deploy' command.
+func deployServer(cfg Config) error {
+	if _, err := os.Stat("quick-mail-server"); err != nil {
+		return fmt.Errorf("quick-mail-server binary not found in current directory")
+	}
 	client, err := sshConnectCfg(cfg)
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
 	}
 	defer client.Close()
+	return deployWith(client, cfg)
+}
+
+// deployWith writes the token env file, uploads the binary, applies setcap, and
+// restarts the systemd service. All privileged steps are passwordless after
+// oneTimeSetup. Falls back to nohup if the service is not installed.
+func deployWith(client *gossh.Client, cfg Config) error {
+	home := "/home/" + cfg.SSHUser
+	remoteBin := home + "/quick-mail-server"
+	remoteTmp := home + "/quick-mail-server.tmp"
+
+	// Token env file (no sudo needed; owned by the user).
+	fmt.Print("  Syncing token... ")
+	if err := sshRunIn(client, "sh -c 'cat > "+home+"/quick-mail.env && chmod 600 "+home+"/quick-mail.env'",
+		"TOKEN="+cfg.Token+"\n"); err != nil {
+		return fmt.Errorf("write env: %w", err)
+	}
+	fmt.Println("ok")
 
 	fmt.Print("  Uploading binary... ")
-	if err := sshUpload(client, "sokolabs-server", remoteTmp); err != nil {
+	if err := sshUpload(client, "quick-mail-server", remoteTmp); err != nil {
 		return fmt.Errorf("upload: %w", err)
 	}
 	fmt.Println("ok")
 
+	hasSvc := false
+	if _, err := sshRun(client, "test -f /etc/systemd/system/quick-mail-server.service"); err == nil {
+		hasSvc = true
+	}
+
 	fmt.Print("  Restarting server... ")
-	remote := fmt.Sprintf(
-		"pkill sokolabs-server 2>/dev/null; sleep 1;"+
-			" chmod +x %s; mv %s %s;"+
-			" sudo setcap 'cap_net_bind_service=+ep' %s 2>/dev/null && echo '[setcap ok]' || echo '[setcap failed - run sudo setcap if port 25 breaks]';"+
-			" cd %s && TOKEN=%s nohup ./sokolabs-server >> mailserver.log 2>&1 & sleep 2; pgrep -a sokolabs-server",
-		remoteTmp, remoteTmp, remoteBin, remoteBin, home, cfg.Token,
-	)
+	var remote string
+	if hasSvc {
+		remote = fmt.Sprintf(
+			"chmod +x %s && mv %s %s &&"+
+				" sudo -n setcap 'cap_net_bind_service=+ep' %s &&"+
+				" sudo -n systemctl restart quick-mail-server &&"+
+				" sleep 2 && systemctl is-active quick-mail-server",
+			remoteTmp, remoteTmp, remoteBin, remoteBin)
+	} else {
+		// Fallback: no systemd unit yet, run directly.
+		remote = fmt.Sprintf(
+			"pkill quick-mail-server 2>/dev/null; sleep 1;"+
+				" chmod +x %s; mv %s %s;"+
+				" sudo -n setcap 'cap_net_bind_service=+ep' %s 2>/dev/null;"+
+				" cd %s && set -a && . ./quick-mail.env && set +a &&"+
+				" nohup ./quick-mail-server >> mailserver.log 2>&1 & sleep 2; pgrep -a quick-mail-server",
+			remoteTmp, remoteTmp, remoteBin, remoteBin, home)
+	}
 	out, err := sshRun(client, remote)
 	fmt.Println()
 	for _, line := range strings.Split(out, "\n") {
