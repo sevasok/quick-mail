@@ -368,50 +368,44 @@ func ensureToken(cfg *Config) bool {
 	return false
 }
 
-// guestWizard configures the client to connect to someone else's server. No
-// SSH, DNS or provisioning is involved: the guest just needs the server address
-// and a token issued by the owner.
+// guestWizard configures the client to connect to an existing server.
 func guestWizard(r *bufio.Reader, cfg *Config) {
 	wasGuest := cfg.Guest
 	cfg.Guest = true
-	cfg.CatchAll = false // guests manage the shared mailbox list
+	cfg.CatchAll = false
 	cfg.CFToken = ""
-	fmt.Println("Joining an existing server.")
-	cfg.VPSIP = promptLine(r, "  Server IP or host", cfg.VPSIP)
-	cfg.VPSPort = promptLine(r, "  Server port", cfg.VPSPort)
-	// Don't pre-fill the token with the auto-generated admin token from a fresh
-	// config; only keep a default if this client was already a guest.
+	cfg.VPSIP = promptLine(r, "  Server IP", cfg.VPSIP)
+	cfg.VPSPort = promptLine(r, "  Port", cfg.VPSPort)
 	tokenDefault := ""
 	if wasGuest {
 		tokenDefault = cfg.Token
 	}
-	cfg.Token = strings.TrimSpace(promptLine(r, "  Access token (from the server owner)", tokenDefault))
+	cfg.Token = strings.TrimSpace(promptLine(r, "  Token", tokenDefault))
 	fmt.Println()
 }
 
 func setupWizard(r *bufio.Reader, cfg *Config) {
-	fmt.Println("=== First-time setup ===")
+	fmt.Println("=== Setup ===")
 	fmt.Println()
 
-	// Step 0: own server vs joining someone else's.
-	fmt.Println("Are you setting up your own mailbox, or joining someone else's server?")
-	fmt.Println("  own   - host and manage your own mail server")
-	fmt.Println("  join  - connect to an existing server (you need its address and a token)")
-	roleDefault := "own"
+	// Role: admin (own server) or guest (joining someone else's).
+	fmt.Println("  admin  - you own the server")
+	fmt.Println("  guest  - you have a token from an admin")
+	roleDefault := "admin"
 	if cfg.Guest {
-		roleDefault = "join"
+		roleDefault = "guest"
 	}
-	role := strings.ToLower(promptLine(r, "  Choice (own / join)", roleDefault))
+	role := strings.ToLower(promptLine(r, "Role (admin / guest)", roleDefault))
 	fmt.Println()
-	if role == "join" || role == "guest" {
+	if role == "guest" {
 		guestWizard(r, cfg)
 		return
 	}
 	cfg.Guest = false
 
 	// Step 1: VPS server
-	fmt.Println("Step 1: VPS server")
-	cfg.VPSIP = promptLine(r, "  VPS IP address", cfg.VPSIP)
+	fmt.Println("Step 1: VPS")
+	cfg.VPSIP = promptLine(r, "  IP address", cfg.VPSIP)
 	ensureToken(cfg)
 	fmt.Println()
 
@@ -424,16 +418,14 @@ func setupWizard(r *bufio.Reader, cfg *Config) {
 	}
 
 	// Step 2: Cloudflare DNS
-	fmt.Println("Step 2: Cloudflare DNS (optional but recommended)")
-	fmt.Println("  This auto-configures MX, SPF and DMARC records and detects your domain.")
-	fmt.Println("  Required token permissions: Zone > DNS > Edit, Zone > Zone > Read")
-	fmt.Println("  Hint: use the 'Edit zone DNS' template, then add Zone:Read.")
+	fmt.Println("Step 2: Cloudflare DNS (optional)")
+	fmt.Println("  Auto-configures MX, SPF, DMARC. Token needs Zone:DNS:Edit + Zone:Zone:Read.")
 	fmt.Println()
-	openTok := promptLine(r, "  Open the Cloudflare token page in your browser now? (y/n)", "y")
+	openTok := promptLine(r, "  Open Cloudflare token page? (y/n)", "y")
 	if strings.ToLower(openTok) == "y" {
 		openURL("https://dash.cloudflare.com/profile/api-tokens")
 	}
-	cfg.CFToken = promptLine(r, "  Cloudflare API token (press Enter to skip)", cfg.CFToken)
+	cfg.CFToken = promptLine(r, "  Cloudflare token (Enter to skip)", cfg.CFToken)
 	if cfg.CFToken != "" {
 		fmt.Print("  Detecting domain from Cloudflare... ")
 		_, zoneName, err := fetchZone(cfg.CFToken)
@@ -451,8 +443,8 @@ func setupWizard(r *bufio.Reader, cfg *Config) {
 
 	// Step 3: Mail mode
 	fmt.Println("Step 3: Mail mode")
-	fmt.Println("  catch-all  - accept mail for any address (simpler, but flagged by validators)")
-	fmt.Println("  list       - only accept mail for addresses you explicitly allow (recommended)")
+	fmt.Println("  catch-all  - accept all addresses")
+	fmt.Println("  list       - only accept addresses you allow (recommended)")
 	modeDefault := "list"
 	if cfg.CatchAll {
 		modeDefault = "catch-all"
@@ -482,16 +474,15 @@ func main() {
 	} else {
 		// Quick re-confirm with ability to change
 		if cfg.Guest {
-			fmt.Printf("Guest of: %s  Token: %s\n", cfg.VPSIP, cfg.Token)
+			fmt.Printf("Server: %s  Token: %s\n", cfg.VPSIP, cfg.Token)
 		} else {
-			fmt.Printf("VPS: %s  Token: %s  Mode: ", cfg.VPSIP, cfg.Token)
+			mode := "list"
 			if cfg.CatchAll {
-				fmt.Println("catch-all")
-			} else {
-				fmt.Println("list")
+				mode = "catch-all"
 			}
+			fmt.Printf("VPS: %s  Token: %s  Mode: %s\n", cfg.VPSIP, cfg.Token, mode)
 		}
-		fmt.Println("Press Enter to continue, or type 'setup' to reconfigure.")
+		fmt.Println("Enter to continue, or 'setup' to reconfigure.")
 		input, _ := r.ReadString('\n')
 		if strings.TrimSpace(strings.ToLower(input)) == "setup" {
 			setupWizard(r, &cfg)
@@ -535,9 +526,7 @@ func main() {
 	if err := ping(baseURL, cfg.Token); err != nil {
 		fmt.Println("not reachable")
 		if cfg.Guest {
-			fmt.Println()
-			fmt.Println("Could not reach the server at " + baseURL + ".")
-			fmt.Println("Check the address and token with the server owner, then try again.")
+			fmt.Println("Cannot reach " + baseURL + ". Check the address and token, then try again.")
 			pause(r)
 			return
 		}
@@ -547,10 +536,9 @@ func main() {
 		}
 		if err := ping(baseURL, cfg.Token); err != nil {
 			fmt.Println()
-			fmt.Println("The server is running but its port is not reachable from here.")
-			fmt.Println("Open these inbound ports in your VPS provider's firewall:")
-			fmt.Println("  TCP " + cfg.VPSPort + "  (quick-mail API)")
-			fmt.Println("  TCP 25    (SMTP, to receive mail)")
+			fmt.Println("Server port is not reachable. Open these ports in your VPS firewall:")
+			fmt.Println("  TCP " + cfg.VPSPort + "  (API)")
+			fmt.Println("  TCP 25    (SMTP)")
 			fmt.Println("Then run quick-mail again.")
 			pause(r)
 			return
