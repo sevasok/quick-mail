@@ -243,6 +243,24 @@ func changeMailbox(baseURL, token, op, addr string) ([]string, error) {
 	return list, nil
 }
 
+// clearMailboxes removes all addresses from the server in a single request.
+// Admin token required.
+func clearMailboxes(baseURL, token string) error {
+	req, _ := http.NewRequest(http.MethodDelete, baseURL+"/mailboxes?token="+token, nil)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("admin token required")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func containsStr(list []string, s string) bool {
 	for _, e := range list {
 		if e == s {
@@ -628,7 +646,7 @@ func main() {
 	fmt.Println()
 	printHelp := func() {
 		if cfg.Guest {
-			fmt.Println("Commands: add <email>  |  del <email>  |  del all (remove all addresses)  |  list  |  sync  |  clear (delete received mail)  |  setup  |  help")
+			fmt.Println("Commands: add <email>  |  del <email>  |  list  |  sync  |  clear (delete received mail)  |  setup  |  help")
 		} else if cfg.CatchAll {
 			fmt.Println("Mode: catch-all (accepting all addresses)")
 			fmt.Println("Commands: clear (delete received mail)  |  deploy  |  setup  |  update  |  guest <name>  |  guests  |  revoke <name|token>  |  revoke all  |  help")
@@ -674,18 +692,14 @@ func main() {
 				}
 			case "del":
 				if arg != "" && strings.ToLower(arg) == "all" {
-					list, err := syncMailboxes(baseURL, cfg.Token)
-					if err != nil {
-						fmt.Println("Error syncing:", err)
+					if cfg.Guest {
+						fmt.Println("Admin only.")
 						continue
 					}
-					for _, addr := range list {
-						_, aerr := changeMailbox(baseURL, cfg.Token, "del", addr)
-						if aerr != nil {
-							fmt.Println("Error removing", addr+":", aerr)
-						} else {
-							fmt.Println("Removed:", addr)
-						}
+					if err := clearMailboxes(baseURL, cfg.Token); err != nil {
+						fmt.Println("Error:", err)
+					} else {
+						fmt.Println("All addresses removed.")
 					}
 					continue
 				}
@@ -694,7 +708,11 @@ func main() {
 					continue
 				}
 				if arg == "" {
-					fmt.Println("Usage: del user@" + cfg.Domain + "  |  del all (delete all emails)")
+					if cfg.Guest {
+						fmt.Println("Usage: del user@" + cfg.Domain)
+					} else {
+						fmt.Println("Usage: del user@" + cfg.Domain + "  |  del all (remove all mailbox addresses)")
+					}
 					continue
 				}
 				arg = strings.ToLower(arg)

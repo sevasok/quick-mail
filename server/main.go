@@ -552,6 +552,19 @@ func startHTTP() {
 			mu.Unlock()
 			fmt.Fprintf(w, "ok, %d mailboxes", len(m))
 			fmt.Printf("Mailboxes replaced: %d entries\n", len(m))
+		case http.MethodDelete:
+			// Remove all mailboxes in one request. Admin only.
+			if !authAdmin(r) {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			mu.Lock()
+			n := len(mailboxes)
+			mailboxes = map[string]bool{}
+			saveMailboxes(mailboxes)
+			mu.Unlock()
+			fmt.Fprintf(w, "ok, removed %d", n)
+			fmt.Printf("All mailboxes cleared (%d)\n", n)
 		}
 	})
 	// Guest-token management. Admin-only: only the owner (long admin token) may
