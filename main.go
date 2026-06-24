@@ -25,7 +25,7 @@ const (
 	configFile    = "quick-mail.cfg"
 	mailboxesFile = "mailboxes.txt"
 	cfAPI         = "https://api.cloudflare.com/client/v4"
-	serverVersion = "4"
+	serverVersion = "5"
 	githubRepo    = "sevasok/quick-mail"
 )
 
@@ -46,6 +46,7 @@ type Config struct {
 	SSHUser  string
 	SSHKey   string
 	CatchAll bool
+	Guest    bool
 }
 
 type Email struct {
@@ -86,6 +87,8 @@ func loadConfig() Config {
 			cfg.SSHKey = parts[1]
 		case "catch_all":
 			cfg.CatchAll = parts[1] == "true"
+		case "guest":
+			cfg.Guest = parts[1] == "true"
 		}
 	}
 	return cfg
@@ -96,6 +99,10 @@ func saveConfig(cfg Config) {
 	if cfg.CatchAll {
 		catchAllVal = "true"
 	}
+	guestVal := "false"
+	if cfg.Guest {
+		guestVal = "true"
+	}
 	os.WriteFile(configFile, []byte(
 		"vps_ip="+cfg.VPSIP+"\n"+
 			"vps_port="+cfg.VPSPort+"\n"+
@@ -104,7 +111,8 @@ func saveConfig(cfg Config) {
 			"domain="+cfg.Domain+"\n"+
 			"ssh_user="+cfg.SSHUser+"\n"+
 			"ssh_key="+cfg.SSHKey+"\n"+
-			"catch_all="+catchAllVal+"\n",
+			"catch_all="+catchAllVal+"\n"+
+			"guest="+guestVal+"\n",
 	), 0600)
 }
 
@@ -228,6 +236,88 @@ func containsStr(list []string, s string) bool {
 	return false
 }
 
+// guestInfo describes a guest token issued by the server owner.
+type guestInfo struct {
+	Name  string `json:"name"`
+	Token string `json:"token"`
+}
+
+// createGuest asks the server to mint a new (short, non-admin) guest token.
+// Admin token required.
+func createGuest(baseURL, token, name string) (guestInfo, error) {
+	u := fmt.Sprintf("%s/guests?name=%s&token=%s", baseURL, url.QueryEscape(name), token)
+	req, _ := http.NewRequest(http.MethodPost, u, nil)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return guestInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return guestInfo{}, fmt.Errorf("admin token required")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return guestInfo{}, fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+	var gi guestInfo
+	if err := json.NewDecoder(resp.Body).Decode(&gi); err != nil {
+		return guestInfo{}, err
+	}
+	return gi, nil
+}
+
+// listGuests returns the current guest tokens. Admin token required.
+func listGuests(baseURL, token string) ([]guestInfo, error) {
+	resp, err := apiClient.Get(baseURL + "/guests?token=" + token)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("admin token required")
+	}
+	var list []guestInfo
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// revokeGuest revokes a single guest token by name or token. Admin token required.
+func revokeGuest(baseURL, token, which string) error {
+	u := fmt.Sprintf("%s/guests?revoke=%s&token=%s", baseURL, url.QueryEscape(which), token)
+	req, _ := http.NewRequest(http.MethodDelete, u, nil)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("admin token required")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// revokeAllGuests revokes every guest token. Admin token required.
+func revokeAllGuests(baseURL, token string) error {
+	u := fmt.Sprintf("%s/guests?all=1&token=%s", baseURL, token)
+	req, _ := http.NewRequest(http.MethodDelete, u, nil)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("admin token required")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func randomToken() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -278,9 +368,46 @@ func ensureToken(cfg *Config) bool {
 	return false
 }
 
+// guestWizard configures the client to connect to someone else's server. No
+// SSH, DNS or provisioning is involved: the guest just needs the server address
+// and a token issued by the owner.
+func guestWizard(r *bufio.Reader, cfg *Config) {
+	wasGuest := cfg.Guest
+	cfg.Guest = true
+	cfg.CatchAll = false // guests manage the shared mailbox list
+	cfg.CFToken = ""
+	fmt.Println("Joining an existing server.")
+	cfg.VPSIP = promptLine(r, "  Server IP or host", cfg.VPSIP)
+	cfg.VPSPort = promptLine(r, "  Server port", cfg.VPSPort)
+	// Don't pre-fill the token with the auto-generated admin token from a fresh
+	// config; only keep a default if this client was already a guest.
+	tokenDefault := ""
+	if wasGuest {
+		tokenDefault = cfg.Token
+	}
+	cfg.Token = strings.TrimSpace(promptLine(r, "  Access token (from the server owner)", tokenDefault))
+	fmt.Println()
+}
+
 func setupWizard(r *bufio.Reader, cfg *Config) {
 	fmt.Println("=== First-time setup ===")
 	fmt.Println()
+
+	// Step 0: own server vs joining someone else's.
+	fmt.Println("Are you setting up your own mailbox, or joining someone else's server?")
+	fmt.Println("  own   - host and manage your own mail server")
+	fmt.Println("  join  - connect to an existing server (you need its address and a token)")
+	roleDefault := "own"
+	if cfg.Guest {
+		roleDefault = "join"
+	}
+	role := strings.ToLower(promptLine(r, "  Choice (own / join)", roleDefault))
+	fmt.Println()
+	if role == "join" || role == "guest" {
+		guestWizard(r, cfg)
+		return
+	}
+	cfg.Guest = false
 
 	// Step 1: VPS server
 	fmt.Println("Step 1: VPS server")
@@ -354,11 +481,15 @@ func main() {
 		setupWizard(r, &cfg)
 	} else {
 		// Quick re-confirm with ability to change
-		fmt.Printf("VPS: %s  Token: %s  Mode: ", cfg.VPSIP, cfg.Token)
-		if cfg.CatchAll {
-			fmt.Println("catch-all")
+		if cfg.Guest {
+			fmt.Printf("Guest of: %s  Token: %s\n", cfg.VPSIP, cfg.Token)
 		} else {
-			fmt.Println("list")
+			fmt.Printf("VPS: %s  Token: %s  Mode: ", cfg.VPSIP, cfg.Token)
+			if cfg.CatchAll {
+				fmt.Println("catch-all")
+			} else {
+				fmt.Println("list")
+			}
 		}
 		fmt.Println("Press Enter to continue, or type 'setup' to reconfigure.")
 		input, _ := r.ReadString('\n')
@@ -375,8 +506,10 @@ func main() {
 
 	saveConfig(cfg)
 
-	// Update DNS if CF token provided
-	if cfg.CFToken != "" {
+	// Update DNS if CF token provided (owner only; guests don't manage DNS).
+	if cfg.Guest {
+		// nothing to do
+	} else if cfg.CFToken != "" {
 		fmt.Print("Updating Cloudflare DNS (MX, SPF, DMARC)... ")
 		if err := updateDNS(cfg.CFToken, cfg.VPSIP, cfg.Domain); err != nil {
 			fmt.Println("Warning:", err)
@@ -397,9 +530,17 @@ func main() {
 
 	// Check connectivity; if unreachable, provision the VPS automatically.
 	// The first-run wizard already provisioned, so don't provision twice.
+	// Guests have no SSH access, so they can't provision: just report the issue.
 	fmt.Print("Connecting to VPS... ")
 	if err := ping(baseURL, cfg.Token); err != nil {
 		fmt.Println("not reachable")
+		if cfg.Guest {
+			fmt.Println()
+			fmt.Println("Could not reach the server at " + baseURL + ".")
+			fmt.Println("Check the address and token with the server owner, then try again.")
+			pause(r)
+			return
+		}
 		if !firstRun {
 			provisionVPS(r, &cfg)
 			time.Sleep(2 * time.Second)
@@ -417,18 +558,21 @@ func main() {
 	}
 	fmt.Println("ok")
 
-	// Version check: auto-deploy the updated binary on mismatch.
-	if v, err := checkServerVersion(baseURL); err == nil && v != serverVersion {
-		fmt.Printf("Updating server (%s -> %s)...\n", v, serverVersion)
-		if err3 := deployServer(cfg); err3 != nil {
-			fmt.Println("Deploy error:", err3)
-		} else {
-			time.Sleep(2 * time.Second)
+	// Version check: auto-deploy the updated binary on mismatch (owner only;
+	// guests can't deploy because they have no SSH access).
+	if !cfg.Guest {
+		if v, err := checkServerVersion(baseURL); err == nil && v != serverVersion {
+			fmt.Printf("Updating server (%s -> %s)...\n", v, serverVersion)
+			if err3 := deployServer(cfg); err3 != nil {
+				fmt.Println("Deploy error:", err3)
+			} else {
+				time.Sleep(2 * time.Second)
+			}
 		}
 	}
 
-	// Push mailbox list to server
-	if cfg.CatchAll {
+	// Push mailbox list to server. Guests always work against the shared list.
+	if !cfg.Guest && cfg.CatchAll {
 		fmt.Print("Pushing catch-all mode to server... ")
 		if err := pushMailboxes(baseURL, cfg.Token, []string{}); err != nil {
 			fmt.Println("Warning:", err)
@@ -476,13 +620,18 @@ func main() {
 	}
 
 	fmt.Println()
-	if cfg.CatchAll {
-		fmt.Println("Mode: catch-all (accepting all addresses)")
-	} else {
-		fmt.Println("Mode: verified list")
-		fmt.Println("Commands: add <email>  |  del <email>  |  list  |  sync")
+	printHelp := func() {
+		if cfg.Guest {
+			fmt.Println("Commands: del all  |  list  |  sync  |  clear  |  update  |  setup  |  help")
+		} else if cfg.CatchAll {
+			fmt.Println("Mode: catch-all (accepting all addresses)")
+			fmt.Println("Commands: clear  |  deploy  |  setup  |  update  |  guest <name>  |  guests  |  revoke <name|token>  |  revoke all  |  help")
+		} else {
+			fmt.Println("Mode: verified list")
+			fmt.Println("Commands: add <email>  |  del <email>  |  del all  |  list  |  sync  |  clear  |  deploy  |  setup  |  update  |  guest <name>  |  guests  |  revoke <name|token>  |  revoke all  |  help")
+		}
 	}
-	fmt.Println("Global commands: clear (delete all mail)  |  deploy (re-deploy server)  |  setup (re-provision VPS)  |  update (update client + server)")
+	printHelp()
 	fmt.Println("Listening for mail on *@" + cfg.Domain + " (Ctrl+C to stop)")
 	fmt.Println()
 
@@ -501,6 +650,10 @@ func main() {
 			}
 			switch cmd {
 			case "add":
+				if cfg.Guest {
+					fmt.Println("Admin only.")
+					continue
+				}
 				if cfg.CatchAll {
 					fmt.Println("Not in list mode.")
 					continue
@@ -518,12 +671,24 @@ func main() {
 					fmt.Println("Added:", arg)
 				}
 			case "del":
+				if arg != "" && strings.ToLower(arg) == "all" {
+					if err := clearInbox(baseURL, cfg.Token); err != nil {
+						fmt.Println("Error:", err)
+					} else {
+						fmt.Println("All emails deleted.")
+					}
+					continue
+				}
+				if cfg.Guest {
+					fmt.Println("Admin only. Use 'del all' to clear all emails.")
+					continue
+				}
 				if cfg.CatchAll {
 					fmt.Println("Not in list mode.")
 					continue
 				}
 				if arg == "" {
-					fmt.Println("Usage: del user@" + cfg.Domain)
+					fmt.Println("Usage: del user@" + cfg.Domain + "  |  del all (delete all emails)")
 					continue
 				}
 				arg = strings.ToLower(arg)
@@ -567,13 +732,78 @@ func main() {
 				} else {
 					fmt.Println("Inbox cleared.")
 				}
+			case "help":
+				printHelp()
+			case "guest":
+				if cfg.Guest {
+					fmt.Println("Admin only.")
+					continue
+				}
+				if arg == "" {
+					fmt.Println("Usage: guest <name>")
+					continue
+				}
+				gi, err := createGuest(baseURL, cfg.Token, arg)
+				if err != nil {
+					fmt.Println("Error creating guest token:", err)
+				} else {
+					fmt.Printf("Guest token for %q: %s\n", gi.Name, gi.Token)
+					fmt.Println("Share this with the guest. They choose 'join' in setup and paste it as the access token.")
+				}
+			case "guests":
+				if cfg.Guest {
+					fmt.Println("Admin only.")
+					continue
+				}
+				list, err := listGuests(baseURL, cfg.Token)
+				if err != nil {
+					fmt.Println("Error listing guests:", err)
+				} else if len(list) == 0 {
+					fmt.Println("No guest tokens.")
+				} else {
+					for _, g := range list {
+						fmt.Printf("  %s\t%s\n", g.Token, g.Name)
+					}
+				}
+			case "revoke":
+				if cfg.Guest {
+					fmt.Println("Admin only.")
+					continue
+				}
+				if arg == "" {
+					fmt.Println("Usage: revoke <name|token>  |  revoke all")
+					continue
+				}
+				if strings.ToLower(arg) == "all" {
+					if err := revokeAllGuests(baseURL, cfg.Token); err != nil {
+						fmt.Println("Error:", err)
+					} else {
+						fmt.Println("All guest tokens revoked.")
+					}
+				} else {
+					if err := revokeGuest(baseURL, cfg.Token, arg); err != nil {
+						fmt.Println("Error:", err)
+					} else {
+						fmt.Println("Revoked:", arg)
+					}
+				}
 			case "deploy":
+				if cfg.Guest {
+					fmt.Println("Admin only.")
+					continue
+				}
 				if err := deployServer(cfg); err != nil {
 					fmt.Println("Deploy error:", err)
 				}
 			case "update":
 				updateAll(cfg)
 			case "init", "setup":
+				if cfg.Guest {
+					setupWizard(r, &cfg)
+					saveConfig(cfg)
+					fmt.Println("Saved. Restart quick-mail to apply changes.")
+					continue
+				}
 				provisionVPS(r, &cfg)
 			}
 		}
@@ -936,19 +1166,21 @@ func updateAll(cfg Config) {
 	latest := strings.TrimPrefix(tag, "v")
 	fmt.Printf("Latest release: %s (current client %s)\n", tag, version)
 
-	// Update and redeploy the server.
-	if url, ok := assets["quick-mail-server"]; ok {
-		fmt.Print("  Downloading server binary... ")
-		if err := downloadTo(url, "quick-mail-server"); err != nil {
-			fmt.Println("error:", err)
-		} else {
-			fmt.Println("ok")
-			if err := deployServer(cfg); err != nil {
-				fmt.Println("  Deploy error:", err)
+	// Update and redeploy the server (admin only; guests have no SSH access).
+	if !cfg.Guest {
+		if url, ok := assets["quick-mail-server"]; ok {
+			fmt.Print("  Downloading server binary... ")
+			if err := downloadTo(url, "quick-mail-server"); err != nil {
+				fmt.Println("error:", err)
+			} else {
+				fmt.Println("ok")
+				if err := deployServer(cfg); err != nil {
+					fmt.Println("  Deploy error:", err)
+				}
 			}
+		} else {
+			fmt.Println("  No server binary in the latest release.")
 		}
-	} else {
-		fmt.Println("  No server binary in the latest release.")
 	}
 
 	// Update the client itself.
