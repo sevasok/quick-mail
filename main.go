@@ -151,7 +151,9 @@ func fetchZone(token string) (zid, zoneName string, err error) {
 	return
 }
 
-func loadLocalMailboxes() []string {
+// loadMailboxHistory returns the local history of addresses this client has
+// used before. It is not authoritative; the server owns the real list.
+func loadMailboxHistory() []string {
 	data, err := os.ReadFile(mailboxesFile)
 	if err != nil {
 		return nil
@@ -166,8 +168,23 @@ func loadLocalMailboxes() []string {
 	return list
 }
 
-func saveLocalMailboxes(list []string) {
-	os.WriteFile(mailboxesFile, []byte(strings.Join(list, "\n")+"\n"), 0600)
+// appendMailboxHistory adds addr to the local history file if not already present.
+func appendMailboxHistory(addr string) {
+	addr = strings.ToLower(strings.TrimSpace(addr))
+	if addr == "" {
+		return
+	}
+	for _, h := range loadMailboxHistory() {
+		if h == addr {
+			return
+		}
+	}
+	f, err := os.OpenFile(mailboxesFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintln(f, addr)
 }
 
 func pushMailboxes(baseURL, token string, list []string) error {
@@ -581,24 +598,13 @@ func main() {
 			fmt.Println("ok")
 		}
 	} else {
-		// List mode: the server is the shared authority. Sync its list first so we
-		// never overwrite addresses other clients added.
+		// Server is the sole authority. Just show what's there; no local merging.
 		fmt.Print("Syncing mailboxes from server... ")
 		serverList, err := syncMailboxes(baseURL, cfg.Token)
 		if err != nil {
 			fmt.Println("Warning:", err)
-			serverList = loadLocalMailboxes()
 		} else {
 			fmt.Printf("ok (%d)\n", len(serverList))
-		}
-
-		// Union any local-only addresses into the shared list (merge, not replace).
-		for _, addr := range loadLocalMailboxes() {
-			if !containsStr(serverList, addr) {
-				if updated, aerr := changeMailbox(baseURL, cfg.Token, "add", addr); aerr == nil {
-					serverList = updated
-				}
-			}
 		}
 
 		// First run with an empty shared list: let the user seed it.
@@ -612,12 +618,11 @@ func main() {
 					break
 				}
 				addr = strings.ToLower(addr)
-				if updated, aerr := changeMailbox(baseURL, cfg.Token, "add", addr); aerr == nil {
-					serverList = updated
+				if _, aerr := changeMailbox(baseURL, cfg.Token, "add", addr); aerr == nil {
+					appendMailboxHistory(addr)
 				}
 			}
 		}
-		saveLocalMailboxes(serverList)
 	}
 
 	fmt.Println()
@@ -660,11 +665,11 @@ func main() {
 					continue
 				}
 				arg = strings.ToLower(arg)
-				updated, err := changeMailbox(baseURL, cfg.Token, "add", arg)
+				_, err := changeMailbox(baseURL, cfg.Token, "add", arg)
 				if err != nil {
 					fmt.Println("Warning adding on server:", err)
 				} else {
-					saveLocalMailboxes(updated)
+					appendMailboxHistory(arg)
 					fmt.Println("Added:", arg)
 				}
 			case "del":
@@ -675,11 +680,10 @@ func main() {
 						continue
 					}
 					for _, addr := range list {
-						updated, aerr := changeMailbox(baseURL, cfg.Token, "del", addr)
+						_, aerr := changeMailbox(baseURL, cfg.Token, "del", addr)
 						if aerr != nil {
 							fmt.Println("Error removing", addr+":", aerr)
 						} else {
-							saveLocalMailboxes(updated)
 							fmt.Println("Removed:", addr)
 						}
 					}
@@ -694,11 +698,10 @@ func main() {
 					continue
 				}
 				arg = strings.ToLower(arg)
-				updated, err := changeMailbox(baseURL, cfg.Token, "del", arg)
+				_, err := changeMailbox(baseURL, cfg.Token, "del", arg)
 				if err != nil {
 					fmt.Println("Warning removing on server:", err)
 				} else {
-					saveLocalMailboxes(updated)
 					fmt.Println("Removed:", arg)
 				}
 			case "list":
@@ -709,9 +712,7 @@ func main() {
 				list, err := syncMailboxes(baseURL, cfg.Token)
 				if err != nil {
 					fmt.Println("Warning syncing from server:", err)
-					list = loadLocalMailboxes()
-				} else {
-					saveLocalMailboxes(list)
+					continue
 				}
 				if len(list) == 0 {
 					fmt.Println("No mailboxes yet. Use: add user@" + cfg.Domain)
@@ -725,8 +726,7 @@ func main() {
 				if err != nil {
 					fmt.Println("Sync error:", err)
 				} else {
-					saveLocalMailboxes(list)
-					fmt.Printf("Synced %d mailboxes from server.\n", len(list))
+					fmt.Printf("%d mailboxes on server.\n", len(list))
 				}
 			case "clear":
 				if err := clearInbox(baseURL, cfg.Token); err != nil {
