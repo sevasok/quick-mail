@@ -546,9 +546,14 @@ func main() {
 	}
 	fmt.Println("ok")
 
-	// Version check: auto-deploy the updated binary on mismatch (owner only;
-	// guests can't deploy because they have no SSH access).
-	if !cfg.Guest {
+	// Version check and auto-deploy (admin) / auto-update client (guest).
+	if cfg.Guest {
+		// Guests auto-update their client binary to stay in sync with the server.
+		if v, err := checkServerVersion(baseURL); err == nil && v != serverVersion {
+			fmt.Printf("Server is version %s, updating client...\n", v)
+			updateAll(cfg)
+		}
+	} else {
 		if v, err := checkServerVersion(baseURL); err == nil && v != serverVersion {
 			fmt.Printf("Updating server (%s -> %s)...\n", v, serverVersion)
 			if err3 := deployServer(cfg); err3 != nil {
@@ -610,7 +615,7 @@ func main() {
 	fmt.Println()
 	printHelp := func() {
 		if cfg.Guest {
-			fmt.Println("Commands: del all  |  list  |  sync  |  clear  |  update  |  setup  |  help")
+			fmt.Println("Commands: add <email>  |  del <email>  |  del all  |  list  |  sync  |  clear  |  setup  |  help")
 		} else if cfg.CatchAll {
 			fmt.Println("Mode: catch-all (accepting all addresses)")
 			fmt.Println("Commands: clear  |  deploy  |  setup  |  update  |  guest <name>  |  guests  |  revoke <name|token>  |  revoke all  |  help")
@@ -638,10 +643,6 @@ func main() {
 			}
 			switch cmd {
 			case "add":
-				if cfg.Guest {
-					fmt.Println("Admin only.")
-					continue
-				}
 				if cfg.CatchAll {
 					fmt.Println("Not in list mode.")
 					continue
@@ -665,10 +666,6 @@ func main() {
 					} else {
 						fmt.Println("All emails deleted.")
 					}
-					continue
-				}
-				if cfg.Guest {
-					fmt.Println("Admin only. Use 'del all' to clear all emails.")
 					continue
 				}
 				if cfg.CatchAll {
@@ -784,6 +781,10 @@ func main() {
 					fmt.Println("Deploy error:", err)
 				}
 			case "update":
+				if cfg.Guest {
+					fmt.Println("Admin only. Client auto-updates on version mismatch.")
+					continue
+				}
 				updateAll(cfg)
 			case "init", "setup":
 				if cfg.Guest {

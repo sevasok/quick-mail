@@ -493,12 +493,6 @@ func startHTTP() {
 			mu.RUnlock()
 			json.NewEncoder(w).Encode(list)
 		case http.MethodPost:
-			// Mailbox add/del changes the shared allowlist, which is admin-only.
-			// Guests may read the list (GET) but may not modify it.
-			if !authAdmin(r) {
-				w.WriteHeader(http.StatusUnauthorized)
-				return
-			}
 			// Incremental, merge-based change so concurrent clients never clobber
 			// the shared list. op=add adds one address; op=del removes one. The
 			// updated authoritative list is returned as JSON.
