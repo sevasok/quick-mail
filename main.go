@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	gossh "golang.org/x/crypto/ssh"
@@ -535,11 +536,19 @@ func main() {
 	if cfg.Guest {
 		// nothing to do
 	} else if cfg.CFToken != "" {
-		fmt.Print("Updating Cloudflare DNS (MX, SPF, DMARC)... ")
-		if err := updateDNS(cfg.CFToken, cfg.VPSIP, cfg.Domain); err != nil {
+		fmt.Print("Checking Cloudflare DNS... ")
+		needed, err := dnsNeedsUpdate(cfg.CFToken, cfg.VPSIP, cfg.Domain)
+		if err != nil {
 			fmt.Println("Warning:", err)
+		} else if needed {
+			fmt.Print("updating... ")
+			if err := updateDNS(cfg.CFToken, cfg.VPSIP, cfg.Domain); err != nil {
+				fmt.Println("Warning:", err)
+			} else {
+				fmt.Println("ok")
+			}
 		} else {
-			fmt.Println("ok")
+			fmt.Println("ok (already correct)")
 		}
 	} else if firstRun {
 		d := cfg.Domain
@@ -659,6 +668,8 @@ func main() {
 	fmt.Println("Listening for mail on *@" + cfg.Domain + " (Ctrl+C to stop)")
 	fmt.Println()
 
+	var lastID atomic.Int64
+
 	go func() {
 		for {
 			line, _ := r.ReadString('\n')
@@ -745,6 +756,19 @@ func main() {
 					fmt.Println("Sync error:", err)
 				} else {
 					fmt.Printf("%d mailboxes on server.\n", len(list))
+				}
+				emails, err := fetchMail(baseURL, cfg.Token, lastID.Load())
+				if err != nil {
+					fmt.Println("Mail sync error:", err)
+				} else if len(emails) == 0 {
+					fmt.Println("No new mail.")
+				} else {
+					for _, e := range emails {
+						printEmail(e)
+						if e.ID > lastID.Load() {
+							lastID.Store(e.ID)
+						}
+					}
 				}
 			case "clear":
 				if err := clearInbox(baseURL, cfg.Token); err != nil {
@@ -833,16 +857,15 @@ func main() {
 		}
 	}()
 
-	var lastID int64
 	for {
-		emails, err := fetchMail(baseURL, cfg.Token, lastID)
+		emails, err := fetchMail(baseURL, cfg.Token, lastID.Load())
 		if err != nil {
 			fmt.Println("Poll error:", err)
 		} else {
 			for _, e := range emails {
 				printEmail(e)
-				if e.ID > lastID {
-					lastID = e.ID
+				if e.ID > lastID.Load() {
+					lastID.Store(e.ID)
 				}
 			}
 		}
@@ -1474,6 +1497,52 @@ func deployWith(client *gossh.Client, cfg Config) error {
 		return fmt.Errorf("restart: %w", err)
 	}
 	return nil
+}
+
+// dnsNeedsUpdate returns true if any of the required DNS records (A, MX, SPF,
+// DMARC) are missing or point to the wrong value. Only then does the caller
+// need to call updateDNS. All records are fetched in one API call.
+func dnsNeedsUpdate(token, vpsIP, dom string) (bool, error) {
+	zid, _, err := fetchZone(token)
+	if err != nil {
+		return false, err
+	}
+	mailHost := "mail." + dom
+	wantSPF := "v=spf1 ip4:" + vpsIP + " -all"
+
+	// Fetch all records for the zone in one request (up to 100; enough for any
+	// normal domain). We check them locally instead of making 4 round trips.
+	res, err := cfReq(token, "GET", "/zones/"+zid+"/dns_records?per_page=100", nil)
+	if err != nil {
+		return false, err
+	}
+	items, _ := res["result"].([]interface{})
+
+	var hasA, hasMX, hasSPF, hasDMARC bool
+	for _, item := range items {
+		rec, _ := item.(map[string]interface{})
+		rtype, _ := rec["type"].(string)
+		name, _ := rec["name"].(string)
+		content, _ := rec["content"].(string)
+		switch rtype {
+		case "A":
+			if name == mailHost && content == vpsIP {
+				hasA = true
+			}
+		case "MX":
+			if name == dom && content == mailHost {
+				hasMX = true
+			}
+		case "TXT":
+			if name == dom && content == wantSPF {
+				hasSPF = true
+			}
+			if name == "_dmarc."+dom {
+				hasDMARC = true
+			}
+		}
+	}
+	return !hasA || !hasMX || !hasSPF || !hasDMARC, nil
 }
 
 func updateDNS(token, vpsIP, dom string) error {
